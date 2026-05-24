@@ -1,0 +1,37 @@
+# MARK-XX — Local Jarvis AI Assistant
+# Core AI
+google-generativeai>=0.8.0
+
+# GUI
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# Speech-to-Text (local)
+faster-whisper>=1.0.0
+
+# Text-to-Speech
+edge-tts>=6.1.9
+pyttsx3>=2.90
+soundfile>=0.12.0
+
+# Audio I/O
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Screen & Vision
+mss>=9.0.1
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Computer Control
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+psutil>=5.9.0
+
+# File Analysis
+PyMuPDF>=1.23.0
+
+# Utilities
+requests>=2.31.0
+aiofiles>=23.2.1
