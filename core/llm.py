@@ -447,7 +447,7 @@ class LLMClient:
                     config=genai_types.GenerateContentConfig(
                         system_instruction=self.system_prompt,
                         temperature=self.temperature,
-                        max_output_tokens=min(self.max_tokens, 4096),
+                        max_output_tokens=min(self.max_tokens, 4096) if self.max_tokens is not None else 4096,
                         safety_settings=SAFETY_SETTINGS,
                     )
                 )
@@ -598,12 +598,13 @@ class LLMClient:
 
     def list_models(self) -> List[str]:
         return [
-            "gemini-3.1-flash-lite",     # 15 RPM / 500 RPD  ← best free tier
-            "gemini-2.5-flash-lite",      # 10 RPM / 20 RPD
-            "gemini-2.5-flash",           # 5 RPM  / 20 RPD
-            "gemini-3-flash",             # 5 RPM  / 20 RPD
-            "gemini-3.5-flash",           # 5 RPM  / 20 RPD
-            "gemini-2.5-flash-preview-05-20",
-            "gemini-1.5-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
             "gemini-1.5-pro",
+            "gemini-3.5-flash",
+            "gemini-3-flash",
+            "gemini-2.5-flash",
+            "gemini-1.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash-lite",
         ]

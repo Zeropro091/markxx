@@ -6,6 +6,7 @@ Rotating file log + console. Import `get_logger` anywhere.
 import logging
 import logging.handlers
 import sys
+import os
 from pathlib import Path
 
 
@@ -36,9 +37,12 @@ def _setup_root_logger() -> logging.Logger:
     fh.setFormatter(logging.Formatter(FMT_FILE, datefmt=DATEFMT))
     root.addHandler(fh)
 
-    # ── Console (INFO+) ───────────────────────────────────────────────────────
+    # ── Console ───────────────────────────────────────────────────────────────
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
+    if os.getenv("MARK_CLI") == "1":
+        ch.setLevel(logging.WARNING)
+    else:
+        ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter(FMT_CONSOLE, datefmt=DATEFMT))
     # Fix Windows CP1252 console encoding for emoji/arrows in log messages
     if hasattr(ch.stream, 'reconfigure'):

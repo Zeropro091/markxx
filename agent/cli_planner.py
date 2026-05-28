@@ -218,15 +218,28 @@ class CLIPlanner:
         "web_search":   "\ud83d\udd0e",
         "remember_note": "\ud83e\udde0",
         "recall_notes":  "\ud83d\udd0e",
+        "self_evolve":   "🧬",
     }
 
     def __init__(self, llm: LLMClient, memory: Memory,
                  working_dir: str = ".",
                  mode: str = "auto",           # auto | normal | strict
                  budget_usd: float = 1.0,      # Token budget
-                 dry_run: bool = False):        # Dry-run mode
+                 dry_run: bool = False,        # Dry-run mode
+                 settings = None):             # Tunable settings object
         self.llm = llm
         self.memory = memory
+
+        if settings is None:
+            from config.settings import load_settings
+            self.settings = load_settings()
+        else:
+            self.settings = settings
+
+        # Load customizable parameters
+        self.max_steps = self.settings.cli_max_steps
+        self.max_result_len = self.settings.cli_max_result_len
+        self.max_heal_retries = self.settings.cli_max_heal_retries
 
         # Pillar 3: Context management
         self.ignore = MarkIgnore(working_dir)
@@ -235,9 +248,9 @@ class CLIPlanner:
         self.mapper = WorkspaceMapper(working_dir, self.ignore)
 
         # Pillar 4: Safety
-        self.jail = PathJail(working_dir)
+        self.jail = PathJail(working_dir, forbidden_patterns=self.settings.cli_forbidden_patterns)
         self.redactor = SecretRedactor()
-        self.interceptor = Interceptor(mode=mode)
+        self.interceptor = Interceptor(mode=mode, dangerous_tools=self.settings.cli_dangerous_tools)
         self.dry_runner = DryRunner()
         self.dry_runner.active = dry_run
 
@@ -266,7 +279,13 @@ class CLIPlanner:
             workspace_map=workspace_map,
             tool_descriptions=TOOL_DESCRIPTIONS,
         )
-        self.llm.update_system_prompt(prompt)
+
+        if self.settings.cli_system_prompt:
+            prompt += f"\n\n## Custom Developer Rules\n{self.settings.cli_system_prompt}"
+
+        # Only update (and reset chat) if the prompt actually changed
+        if prompt != self.llm.system_prompt:
+            self.llm.update_system_prompt(prompt)
 
     def process(self, user_input: str, working_dir: str = ".") -> str:
         """Run the full ReAct loop synchronously. Returns the final response."""
@@ -282,7 +301,7 @@ class CLIPlanner:
         self._heal_attempts = 0
 
         try:
-            while steps < MAX_STEPS:
+            while steps < self.max_steps:
                 # Pillar 3: Check token budget
                 if self.budget.is_exhausted:
                     print(f"\n  {C.RED}[BUDGET EXHAUSTED] {self.budget.usage_summary}{C.RESET}")
@@ -323,7 +342,7 @@ class CLIPlanner:
                         if not allowed:
                             self._print_blocked(action, reason)
                             tool_result = f"BLOCKED: {reason}"
-                            self._feed_result(action, tool_result, current_message)
+                            current_message = self._feed_result(action, tool_result, current_message)
                             continue
 
                 # Pillar 4: Interceptor (human-in-the-loop)
@@ -331,7 +350,7 @@ class CLIPlanner:
                 if not approved:
                     self._print_blocked(action, reason)
                     tool_result = f"REJECTED: {reason}"
-                    self._feed_result(action, tool_result, current_message)
+                    current_message = self._feed_result(action, tool_result, current_message)
                     continue
 
                 # Pillar 4: Dry-run mode
@@ -339,7 +358,7 @@ class CLIPlanner:
                     self.dry_runner.record(action, args)
                     self._print_dry_run(action, args)
                     tool_result = f"[DRY RUN] Would execute: {action}({list(args.keys())})"
-                    self._feed_result(action, tool_result, current_message)
+                    current_message = self._feed_result(action, tool_result, current_message)
                     continue
 
                 # Memory shortcuts handled locally
@@ -354,6 +373,21 @@ class CLIPlanner:
                     val = self.memory.get_pref(key, "(not found)")
                     tool_result = f"{key}: {val}"
                     self._print_tool("\U0001f50e", "recall", tool_result)
+
+                elif action == "self_evolve":
+                    if not self.settings.cli_enable_self_evolution:
+                        tool_result = "Error: Self-evolution is disabled in settings. Warn the user or ask them to enable it under Settings (Ctrl+S)."
+                        self._print_blocked("self_evolve", "Disabled in settings")
+                    else:
+                        prompt = args.get("prompt", "")
+                        if not prompt:
+                            tool_result = "Error: Please provide a 'prompt' argument for self-evolution."
+                        else:
+                            print(f"\n  🧬 [SELF-EVOLUTION] Agent triggered self-evolution: {prompt}")
+                            from agent.evolution import SelfEvolver
+                            evolver = SelfEvolver(self, self.working_dir)
+                            tool_result = evolver.run_evolution(prompt)
+                            self._print_tool("🧬", "self_evolve", "Evolution attempt finished.")
 
                 else:
                     # Pillar 4: Redact secrets from tool args before display
@@ -376,8 +410,8 @@ class CLIPlanner:
                     # try to fix it automatically
                     if action == "run_command" and self._is_failure(tool_result):
                         self._heal_attempts += 1
-                        if self._heal_attempts <= MAX_HEAL_RETRIES:
-                            print(f"  {C.YELLOW}[SELF-HEAL] Command failed (attempt {self._heal_attempts}/{MAX_HEAL_RETRIES}){C.RESET}")
+                        if self._heal_attempts <= self.max_heal_retries:
+                            print(f"  {C.YELLOW}[SELF-HEAL] Command failed (attempt {self._heal_attempts}/{self.max_heal_retries}){C.RESET}")
                             # Don't truncate — give the LLM the full error
                             tool_result = (
                                 f"COMMAND FAILED (attempt {self._heal_attempts}):\n{tool_result}\n\n"
@@ -385,14 +419,14 @@ class CLIPlanner:
                                 f"You can edit the file and re-run the command."
                             )
                         else:
-                            print(f"  {C.RED}[SELF-HEAL] Max retries ({MAX_HEAL_RETRIES}) reached{C.RESET}")
+                            print(f"  {C.RED}[SELF-HEAL] Max retries ({self.max_heal_retries}) reached{C.RESET}")
                             self._heal_attempts = 0
                     elif action != "run_command":
                         self._heal_attempts = 0  # Reset on non-command steps
 
                 # Truncate very long results (context management)
-                if len(str(tool_result)) > MAX_RESULT_LEN:
-                    tool_result = str(tool_result)[:MAX_RESULT_LEN] + "\n... [truncated]"
+                if len(str(tool_result)) > self.max_result_len:
+                    tool_result = str(tool_result)[:self.max_result_len] + "\n... [truncated]"
 
                 # Feed result back as next message
                 current_message = (
@@ -481,7 +515,10 @@ class CLIPlanner:
 
     def _feed_result(self, action, tool_result, current_message):
         """Helper to feed a result back without executing."""
-        pass  # Used by the continue flow above
+        return (
+            f"Tool `{action}` returned:\n```\n{tool_result}\n```\n"
+            f"Continue with the task. If done, give the final response without a tool call."
+        )
 
     # ── Terminal output helpers ────────────────────────────────────────────────
 
@@ -490,8 +527,18 @@ class CLIPlanner:
         print(f"{C.DIM}{C.CYAN}  {msg}{C.RESET}")
 
     def _print_tool(self, icon: str, name: str, summary: str):
-        display = summary.replace("\n", " ")[:120]
-        print(f"  {icon} {C.BOLD}{C.WHITE}{name}{C.RESET} {C.DIM}{display}{C.RESET}")
+        if "\n" in summary:
+            lines = summary.split("\n")
+            limit = 10
+            truncated = len(lines) > limit
+            display_lines = lines[:limit]
+            indented = "\n".join(f"    {C.DIM}{line}{C.RESET}" for line in display_lines)
+            if truncated:
+                indented += f"\n    {C.DIM}... ({len(lines) - limit} more lines){C.RESET}"
+            print(f"  {icon} {C.BOLD}{C.WHITE}{name}{C.RESET} {C.DIM}returned:{C.RESET}\n{indented}")
+        else:
+            display = summary[:120]
+            print(f"  {icon} {C.BOLD}{C.WHITE}{name}{C.RESET} {C.DIM}{display}{C.RESET}")
 
     def _print_blocked(self, action: str, reason: str):
         print(f"  {C.RED}BLOCKED {action}: {reason}{C.RESET}")

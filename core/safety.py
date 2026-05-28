@@ -218,9 +218,10 @@ class TokenBudget:
     def usage_summary(self) -> str:
         in_tok = self.total_input_chars / self.CHARS_PER_TOKEN
         out_tok = self.total_output_chars / self.CHARS_PER_TOKEN
+        budget_str = "Unlimited" if self.max_budget_usd == float('inf') or self.max_budget_usd > 1000000 else f"${self.max_budget_usd:.2f}"
         return (f"Input: ~{in_tok:,.0f} tokens | "
                 f"Output: ~{out_tok:,.0f} tokens | "
-                f"Est. cost: ${self.estimated_cost_usd:.4f} / ${self.max_budget_usd:.2f}")
+                f"Est. cost: ${self.estimated_cost_usd:.4f} / {budget_str}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,8 +343,9 @@ class PathJail:
         ".ssh", ".gnupg",
     ]
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, forbidden_patterns: List[str] = None):
         self.root = Path(project_root).resolve()
+        self.forbidden_patterns = forbidden_patterns if forbidden_patterns is not None else self.FORBIDDEN_PATTERNS
 
     def is_allowed(self, path: str, mode: str = "write") -> Tuple[bool, str]:
         """Check if a path operation is allowed.
@@ -368,7 +370,7 @@ class PathJail:
             return False, f"Path outside project jail: {path} (project root: {self.root})"
 
         # Check forbidden patterns
-        for pattern in self.FORBIDDEN_PATTERNS:
+        for pattern in self.forbidden_patterns:
             if pattern in str(target).replace("\\", "/").lower():
                 return False, f"Refusing to {mode} sensitive file: {path} (matches '{pattern}')"
 
@@ -445,8 +447,9 @@ class Interceptor:
     - "strict": Ask for every tool call
     """
 
-    def __init__(self, mode: str = "normal"):
+    def __init__(self, mode: str = "normal", dangerous_tools: List[str] = None):
         self.mode = mode
+        self.dangerous_tools = set(dangerous_tools) if dangerous_tools is not None else DANGEROUS_TOOLS
         self._auto_approved: Set[str] = set()  # Tools auto-approved for this session
 
     def should_approve(self, action: str, args: dict) -> Tuple[bool, str]:
@@ -462,7 +465,7 @@ class Interceptor:
             return self._ask_user(action, args)
 
         # Normal mode: ask only for dangerous tools
-        if action in DANGEROUS_TOOLS and action not in self._auto_approved:
+        if action in self.dangerous_tools and action not in self._auto_approved:
             return self._ask_user(action, args)
 
         return True, ""

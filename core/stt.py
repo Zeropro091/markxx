@@ -32,6 +32,7 @@ class STTWorker(QThread):
     listening_started = pyqtSignal()       # mic opened / speech detected
     listening_stopped = pyqtSignal()       # processing started
     silence_countdown = pyqtSignal(float)  # countdown seconds remaining
+    wake_word_detected = pyqtSignal()      # wake word heard — UI can acknowledge
     error_occurred    = pyqtSignal(str)
 
     def __init__(self, model_size: str = "base", language: str = "en",
@@ -124,7 +125,7 @@ class STTWorker(QThread):
                 else:
                     # Still speaking — reset silence timer
                     self._silence_start = 0.0
-                    self.silence_countdown.emit(SILENCE_GATE_SEC)
+                    self.silence_countdown.emit(self.silence_gate_sec)
 
     # ── Transcription ─────────────────────────────────────────────────────────
     def _transcribe(self, audio_native: np.ndarray) -> Optional[str]:

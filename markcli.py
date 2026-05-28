@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
 """
 MARK-XX CLI Agent
 Interactive terminal-based AI agent with full safety, context management,
 self-healing, and state persistence.
 
 Usage:
-    python markcli.py                          # Launch in current directory
+    python markcli.py                          # Launch interactive Textual TUI
+    python markcli.py --classic                # Launch in classic terminal REPL mode
     python markcli.py --model gemini-2.5-flash # Use a specific model
     python markcli.py --key YOUR_API_KEY       # Override API key
     python markcli.py --budget 0.50            # Set token budget ($0.50)
@@ -19,6 +19,13 @@ import sys
 import os
 from pathlib import Path
 
+# Mark CLI mode to suppress INFO log spam to stdout
+os.environ["MARK_CLI"] = "1"
+
+# Enable ANSI escape sequence rendering on Windows Console/PowerShell
+if os.name == 'nt':
+    os.system('')
+
 # Make sure project root is on sys.path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
@@ -30,9 +37,10 @@ def main():
     api_key_override = None
     working_dir = "."
     mode = "auto"          # auto | normal | strict
-    budget_usd = 1.0       # Token budget in USD
+    budget_usd = float('inf')  # Token budget in USD (unlimited by default)
     dry_run = False
     do_resume = False
+    classic_mode = False
 
     args = sys.argv[1:]
     i = 0
@@ -59,6 +67,8 @@ def main():
             dry_run = True; i += 1
         elif arg in ("--resume", "-r"):
             do_resume = True; i += 1
+        elif arg in ("--classic", "--repl"):
+            classic_mode = True; i += 1
         elif arg in ("--help", "-h"):
             print(__doc__)
             sys.exit(0)
@@ -120,7 +130,7 @@ def main():
         system_prompt="",
         extra_keys=all_keys[1:] if len(all_keys) > 1 else [],
         temperature=settings.llm_temperature,
-        max_tokens=settings.llm_max_tokens,
+        max_tokens=None,  # None means unlimited (restricted only by model default max output limits)
     )
 
     # Resolve working directory
@@ -133,7 +143,14 @@ def main():
         mode=mode,
         budget_usd=budget_usd,
         dry_run=dry_run,
+        settings=settings,
     )
+
+    if not classic_mode:
+        from tui import MarkTUI
+        app = MarkTUI(planner, settings, working_dir)
+        app.run()
+        sys.exit(0)
 
     # ── Print banner ──────────────────────────────────────────────────────────
     mode_label = {"auto": "YOLO", "normal": "Normal", "strict": "Strict"}[mode]
@@ -143,7 +160,8 @@ def main():
     print(f"  {BOLD}{CYAN}MARK-XX CLI Agent{RESET}{dry_label}")
     print(f"  {DIM}Model: {settings.gemini_model}")
     print(f"  Working: {working_dir}")
-    print(f"  Mode: {mode_label} | Budget: ${budget_usd:.2f}")
+    budget_label = "Unlimited" if budget_usd == float('inf') else f"${budget_usd:.2f}"
+    print(f"  Mode: {mode_label} | Budget: {budget_label}")
     print(f"  Type a task, /help for commands, /quit to exit{RESET}")
     print()
 
@@ -194,6 +212,10 @@ def main():
     /dir [PATH]       Change or show working directory
     /map              Show workspace import graph
     /ignore           Show .markignore rules
+    /evolve PROMPT    Self-evolution rewrite (branch checkout & rollback safety)
+    /schedule "task" every X / daily Y   Schedule automated runs
+    /unschedule ID    Remove a scheduled job
+    /jobs             List all scheduled jobs
 """)
                 continue
 
@@ -316,6 +338,64 @@ def main():
                     print(f"  {GREEN}  (.markignore file loaded){RESET}")
                 else:
                     print(f"  {YELLOW}  (no .markignore file -- using defaults){RESET}")
+                continue
+
+            elif cmd == "/evolve":
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"  {YELLOW}Usage: /evolve <prompt>{RESET}")
+                else:
+                    prompt = parts[1].strip()
+                    print(f"\n  🧬 Starting self-evolution: {prompt}...")
+                    from agent.evolution import SelfEvolver
+                    evolver = SelfEvolver(planner, working_dir)
+                    result = evolver.run_evolution(prompt)
+                    print(f"\n  🧬 {BOLD}EVOLUTION RESULT:{RESET}")
+                    print(result)
+                continue
+
+            elif cmd == "/schedule":
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"  {YELLOW}Usage: /schedule \"task prompt\" every <minutes> OR /schedule \"task prompt\" daily <HH:MM>{RESET}")
+                else:
+                    import re
+                    m = re.match(r'^"(.*?)"\s+(every|daily)\s+(.*)$', parts[1].strip(), re.IGNORECASE)
+                    if not m:
+                        print(f"  {YELLOW}Usage: /schedule \"task prompt\" every <minutes> OR /schedule \"task prompt\" daily <HH:MM>{RESET}")
+                    else:
+                        prompt, s_type, s_val = m.groups()
+                        s_type = "interval" if s_type.lower() == "every" else "daily"
+                        s_val = s_val.replace("minutes", "").replace("minute", "").strip()
+                        from core.scheduler import JobScheduler
+                        sched = JobScheduler()
+                        job = sched.add_job(prompt, s_type, s_val)
+                        print(f"  {GREEN}Job scheduled successfully! ID: {job['id']} | Next Run: {job['next_run']}{RESET}")
+                continue
+
+            elif cmd == "/unschedule":
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"  {YELLOW}Usage: /unschedule <job_id>{RESET}")
+                else:
+                    from core.scheduler import JobScheduler
+                    sched = JobScheduler()
+                    if sched.remove_job(parts[1].strip()):
+                        print(f"  {GREEN}Job {parts[1].strip()} removed.{RESET}")
+                    else:
+                        print(f"  {RED}Job ID {parts[1].strip()} not found.{RESET}")
+                continue
+
+            elif cmd == "/jobs":
+                from core.scheduler import JobScheduler
+                sched = JobScheduler()
+                if not sched.jobs:
+                    print(f"  {DIM}No scheduled jobs active.{RESET}")
+                else:
+                    print(f"\n  {BOLD}Active Scheduled Jobs:{RESET}")
+                    for j in sched.jobs:
+                        sched_desc = f"every {j['value']}m" if j["schedule_type"] == "interval" else f"daily at {j['value']}"
+                        print(f"    ID: {j['id']} | \"{j['task_prompt']}\" ({sched_desc}) | Next: {j['next_run']}")
                 continue
 
             elif cmd == "/dir":

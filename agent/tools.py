@@ -247,6 +247,7 @@ TOOLS: Dict[str, Callable] = {
     "update_shared_session": tool_update_shared_session,
     "remember":              tool_remember,
     "recall":                tool_recall,
+    "self_evolve":           lambda args: "self_evolve_handled_by_planner",
 }
 
 # ── Optional note-taking tools ────────────────────────────────────────────────
@@ -306,6 +307,7 @@ recall_notes     {"query":"<keyword>"}                                -- search 
 remember         {"key":"<k>","value":"<v>"}                          -- store a preference
 recall           {"key":"<k>"}                                        -- retrieve a preference
 update_shared_session {"key":"<k>","value":"<v>"}                     -- sync state across AI instances
+self_evolve      {"prompt":"<what to improve/add>"}                   -- trigger self-evolution to improve/rewrite my own codebase
 """ + _NOTES_DESCRIPTION
 
 

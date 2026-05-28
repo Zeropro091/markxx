@@ -364,6 +364,10 @@ class SettingsDialog(QDialog):
         f.addRow(self._hint("Seconds of silence before MARK processes your speech."))
         self.wake_word_input = QLineEdit(self.settings.wake_word)
         f.addRow("Wake Word:", self.wake_word_input)
+        self.wake_enabled_cb = QCheckBox("Enable wake word activation (always-on passive listening)")
+        self.wake_enabled_cb.setChecked(self.settings.wake_word_enabled)
+        f.addRow("", self.wake_enabled_cb)
+        f.addRow(self._hint('When enabled, MARK only responds after hearing "hey mark", "hello mark", etc.'))
         tabs.addTab(wrap(vo), "🎙️ Voice")
 
         # ══════════════════════════════════════════════════ TAB 3: Interface
@@ -432,6 +436,7 @@ class SettingsDialog(QDialog):
         s.silence_gate_sec = self.gate_slider.value() / 10.0
         s.silence_hysteresis = s.mic_sensitivity * 0.6
         s.wake_word        = self.wake_word_input.text().strip().lower()
+        s.wake_word_enabled = self.wake_enabled_cb.isChecked()
         s.window_opacity   = self.opacity_slider.value() / 100.0
         s.font_size        = self.font_slider.value()
         _szs = [(380,580),(480,720),(600,800),(700,900)]
@@ -458,6 +463,12 @@ class MarkWindow(QMainWindow):
         self.tts_worker  = tts_worker
         self._is_listening = False
         self._is_thinking  = False
+
+        # ── Wake word state ───────────────────────────────────────────────────
+        self._wake_active = False          # True = active-listen window open
+        self._wake_timer  = QTimer(self)   # countdown for active-listen window
+        self._wake_timer.setSingleShot(True)
+        self._wake_timer.timeout.connect(self._wake_timeout)
 
         self._setup_window()
         self._build_ui()
@@ -782,6 +793,7 @@ class MarkWindow(QMainWindow):
             self.stt_worker.listening_started.connect(self._on_listening_started)
             self.stt_worker.listening_stopped.connect(self._on_listening_stopped)
             self.stt_worker.silence_countdown.connect(self._on_silence_countdown)
+            self.stt_worker.wake_word_detected.connect(self._on_wake_word_detected)
             self.stt_worker.error_occurred.connect(lambda e: self._set_status(f"STT: {e}", error=True))
 
         if self.tts_worker:
@@ -860,8 +872,103 @@ class MarkWindow(QMainWindow):
     def _on_transcribed(self, text: str):
         if not text.strip():
             return
+
+        # ── Wake word gate ────────────────────────────────────────────────────
+        if self.settings.wake_word_enabled and self._is_listening:
+            command = self._check_wake_word(text)
+            if command is not None:
+                # Wake phrase detected — process the command
+                if command:  # has content after wake phrase
+                    self._wake_active = False
+                    self._wake_timer.stop()
+                    self._text_input.setPlainText(command)
+                    self._send_message()
+                else:
+                    # Bare wake phrase (e.g. just "hey mark") — enter active window
+                    self._enter_active_listen()
+                return
+            elif self._wake_active:
+                # Active-listen window open — pass through without wake word
+                self._wake_active = False
+                self._wake_timer.stop()
+                self._text_input.setPlainText(text)
+                self._send_message()
+                return
+            else:
+                # No wake word, not in active window — discard silently
+                self._set_status("💤 Passive listening… (say \"hey mark\")")
+                return
+
+        # ── No wake word mode — direct passthrough ────────────────────────────
         self._text_input.setPlainText(text)
         self._send_message()
+
+    # ── Wake word helpers ─────────────────────────────────────────────────────
+    def _build_wake_phrases(self):
+        """Build list of trigger phrases from the configured wake word."""
+        ww = self.settings.wake_word.lower().strip()
+        if not ww:
+            return []
+        return [
+            f"hey {ww}", f"hello {ww}", f"hi {ww}", f"yo {ww}",
+            f"okay {ww}", f"ok {ww}", f"hey there {ww}",
+            ww,   # bare wake word last (lowest priority)
+        ]
+
+    def _check_wake_word(self, text: str):
+        """
+        Check if text starts with a wake phrase.
+        Returns:
+          - str (command after wake phrase) if wake phrase found
+          - "" if bare wake phrase only
+          - None if no wake phrase detected
+        """
+        import re
+        clean = text.lower().strip()
+        # Remove common Whisper artifacts: punctuation, filler
+        clean = re.sub(r"[.,!?;:]+", " ", clean).strip()
+
+        for phrase in self._build_wake_phrases():
+            if clean.startswith(phrase):
+                remainder = clean[len(phrase):].strip()
+                # Also strip common fillers after wake word
+                remainder = re.sub(r"^[,\.!?\s]+", "", remainder).strip()
+                # Use the original text's casing for the remainder
+                if remainder:
+                    # Find where the command starts in original text
+                    orig_lower = text.lower()
+                    cmd_start = orig_lower.find(remainder[:min(10, len(remainder))])
+                    if cmd_start >= 0:
+                        return text[cmd_start:].strip()
+                    return remainder
+                return ""  # bare wake word
+        return None  # no wake phrase found
+
+    def _enter_active_listen(self):
+        """Wake word heard alone — open active-listen window for follow-up."""
+        self._wake_active = True
+        timeout_ms = int(self.settings.wake_word_timeout * 1000)
+        self._wake_timer.start(timeout_ms)
+        self._set_status("👂 I'm listening…")
+        self._waveform.set_active(True)
+        # Emit wake signal on STT if available
+        if self.stt_worker:
+            self.stt_worker.wake_word_detected.emit()
+        # Short TTS acknowledgment
+        if self.tts_worker and self._tts_toggle.isChecked():
+            self.tts_worker.speak("Yes?")
+
+    def _wake_timeout(self):
+        """Active-listen window expired without a follow-up command."""
+        self._wake_active = False
+        self._waveform.set_active(False)
+        self._set_status("💤 Passive listening… (say \"hey mark\")")
+
+    def _on_wake_word_detected(self):
+        """Visual pulse when wake word signal fires."""
+        self._status_dot.setStyleSheet("color: #40B4FF; margin-top: 8px;")
+        QTimer.singleShot(1500, lambda: self._status_dot.setStyleSheet(
+            "color: #32DC82; margin-top: 8px;") if not self._is_thinking else None)
 
     # ── Planner Callbacks ─────────────────────────────────────────────────────
     def _on_response(self, text: str):
@@ -920,10 +1027,15 @@ class MarkWindow(QMainWindow):
                 self.stt_worker.start()
             else:
                 self.stt_worker.resume()
-            self._set_status("🎤 Mic active — speak anytime")
+            if self.settings.wake_word_enabled:
+                self._set_status(f"💤 Passive listening… (say \"hey {self.settings.wake_word}\")")
+            else:
+                self._set_status("🎤 Mic active — speak anytime")
         else:
             self.stt_worker.pause()
             self._waveform.set_active(False)
+            self._wake_active = False
+            self._wake_timer.stop()
             self._set_status("Ready")
 
     # ── Screenshot / Webcam ───────────────────────────────────────────────────
