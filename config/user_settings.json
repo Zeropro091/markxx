@@ -15,6 +15,8 @@
   "stt_language": "auto",
   "stt_model_size": "large",
   "wake_word": "mark",
+  "wake_word_enabled": true,
+  "wake_word_timeout": 8.0,
   "auto_listen": true,
   "mic_sensitivity": 0.05,
   "silence_hysteresis": 0.03,
@@ -30,5 +32,28 @@
   "max_history_turns": 20,
   "auto_screenshot_on_request": true,
   "speak_responses": true,
-  "memory_db": "C:\\Users\\Putu Ari\\Desktop\\markxx\\memory\\markxx.db"
+  "memory_db": "C:\\Users\\Putu Ari\\Desktop\\markxx\\memory\\markxx.db",
+  "cli_max_steps": 15,
+  "cli_max_result_len": 4000,
+  "cli_max_heal_retries": 3,
+  "cli_dangerous_tools": [
+    "run_command",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "move_file"
+  ],
+  "cli_forbidden_patterns": [
+    ".env",
+    ".env.local",
+    ".env.production",
+    "credentials",
+    "secrets",
+    "id_rsa",
+    "id_ed25519",
+    ".ssh",
+    ".gnupg"
+  ],
+  "cli_system_prompt": "",
+  "cli_enable_self_evolution": true
 }
