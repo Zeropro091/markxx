@@ -197,6 +197,17 @@ def main():
     print(f"  Type a task, /help for commands, /quit to exit{RESET}")
     print()
 
+    # ── TTS engine (optional) ─────────────────────────────────────────────────
+    tts = None
+    try:
+        from core.multi_tts import MultiTTS
+        tts_engine = getattr(settings, 'tts_engine', 'edge')
+        tts_voice = getattr(settings, 'voice_name', 'en-GB-RyanNeural')
+        tts = MultiTTS(engine=tts_engine)
+        tts.enabled = False  # Off by default in CLI, /tts to toggle
+    except Exception:
+        pass
+
     # ── Handle --resume ───────────────────────────────────────────────────────
     if do_resume:
         result = planner.resume()
@@ -239,6 +250,8 @@ def main():
     /build            Exit plan mode (enable all tools)
     /compact          Compact conversation context (save tokens)
     /context          Show context stats
+    /tts              Toggle text-to-speech on/off
+    /voice ENGINE     Switch TTS engine (kokoro/piper/orpheus/edge)
     /resume           Resume last interrupted session
     /model NAME       Switch to a different model
     /mode MODE        Change safety mode (auto/normal/strict)
@@ -512,6 +525,34 @@ def main():
                     print(f"  {YELLOW}📋 Plan mode active (read-only){RESET}")
                 continue
 
+            elif cmd == "/tts":
+                if tts:
+                    state = tts.toggle()
+                    status = tts.status()
+                    label = "ON" if state else "OFF"
+                    print(f"  {GREEN}TTS: {label} (engine: {status['engine']}){RESET}")
+                else:
+                    print(f"  {YELLOW}TTS not available. Install: pip install edge-tts playsound3{RESET}")
+                continue
+
+            elif cmd == "/voice":
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    if tts:
+                        status = tts.status()
+                        print(f"  Current: {status['engine']}")
+                        print(f"  Available: {', '.join(status['available_engines'])}")
+                    else:
+                        print(f"  {YELLOW}TTS not available{RESET}")
+                else:
+                    engine = parts[1].strip().lower()
+                    if tts:
+                        tts.set_engine(engine)
+                        print(f"  {GREEN}TTS engine: {engine}{RESET}")
+                    else:
+                        print(f"  {YELLOW}TTS not available{RESET}")
+                continue
+
             else:
                 print(f"  {YELLOW}Unknown command: {cmd}. Type /help for commands.{RESET}")
                 continue
@@ -520,6 +561,10 @@ def main():
         print()
         response = planner.process(user_input, working_dir)
         planner._print_response(response)
+
+        # TTS: speak the response aloud if enabled
+        if tts and tts.enabled and response:
+            tts.speak_async(response)
 
 
 if __name__ == "__main__":
