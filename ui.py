@@ -785,15 +785,16 @@ class MarkWindow(QMainWindow):
 
     # ── Signal Connections ────────────────────────────────────────────────────
     def _connect_signals(self):
-        self.planner.response_ready.connect(self._on_response)
-        self.planner.tool_executed.connect(self._on_tool_executed)
-        self.planner.thinking.connect(self._on_thinking)
-        self.planner.error_occurred.connect(self._on_error)
-        # Agentic step updates (ReAct loop progress)
-        if hasattr(self.planner, 'step_update'):
-            self.planner.step_update.connect(
-                lambda msg: self._set_status(msg) if msg else None
-            )
+        if self.planner is not None:
+            self.planner.response_ready.connect(self._on_response)
+            self.planner.tool_executed.connect(self._on_tool_executed)
+            self.planner.thinking.connect(self._on_thinking)
+            self.planner.error_occurred.connect(self._on_error)
+            # Agentic step updates (ReAct loop progress)
+            if hasattr(self.planner, 'step_update'):
+                self.planner.step_update.connect(
+                    lambda msg: self._set_status(msg) if msg else None
+                )
 
         if self.stt_worker:
             self.stt_worker.transcribed.connect(self._on_transcribed)
@@ -896,7 +897,10 @@ class MarkWindow(QMainWindow):
             return
         self._text_input.clear()
         self._add_bubble(text, "user")
-        self.planner.submit(text)
+        if self.planner:
+            self.planner.submit(text)
+        else:
+            self._add_bubble("Planner not available in live mode.", "error")
 
     def _on_transcribed(self, text: str):
         if not text.strip():
@@ -1278,7 +1282,7 @@ class MarkWindow(QMainWindow):
             self.stt_worker.stop()
         if self.tts_worker and self.tts_worker.isRunning():
             self.tts_worker.stop()
-        if self.planner.isRunning():
+        if self.planner and self.planner.isRunning():
             self.planner.stop()
 
         event.accept()
