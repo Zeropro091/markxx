@@ -105,11 +105,9 @@ def main():
             log.warning("faster-whisper not installed — voice input disabled.")
 
     # ── Initialise Planner ───────────────────────────────────────────────────
-    planner = None
-    if not getattr(settings, "multimodal_live_mode", False):
-        planner = PlannerWorker(llm_client, memory)
-        planner.start()
-        log.info("Planner started")
+    planner = PlannerWorker(llm_client, memory)
+    planner.start()
+    log.info("Planner started")
 
     # ── Launch UI ────────────────────────────────────────────────────────────
     from ui import MarkWindow
