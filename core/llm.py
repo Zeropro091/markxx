@@ -627,16 +627,33 @@ class LLMClient:
         try:
             stream = self._call_with_rotation(_do)
             text_parts: List[str] = []
-            last_chunk = None
+            function_call = None  # Scan ALL chunks, not just the last one
 
             for chunk in stream:
-                last_chunk = chunk
-                # Extract incremental text from this chunk
+                # ── Check EVERY chunk for function_call ──────────────────
+                # Gemini can send function_call in ANY chunk (often the first/only one)
+                if not function_call:
+                    try:
+                        if hasattr(chunk, 'candidates') and chunk.candidates:
+                            content = getattr(chunk.candidates[0], 'content', None)
+                            if content and hasattr(content, 'parts') and content.parts:
+                                for part in content.parts:
+                                    fc = getattr(part, 'function_call', None)
+                                    if fc and getattr(fc, 'name', None):
+                                        fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
+                                        function_call = {"action": fc.name, "args": fc_args}
+                                        log.info(f"Stream: native function_call detected: {fc.name}")
+                                        break
+                    except Exception as e:
+                        log.debug(f"Stream function_call check: {e}")
+
+                # ── Extract text delta ───────────────────────────────────
                 delta = ""
                 try:
                     delta = chunk.text or ""
                 except (ValueError, AttributeError):
-                    # chunk.text may raise ValueError if blocked; try parts
+                    # chunk.text raises ValueError if the chunk is a function_call
+                    # Try to extract text from parts directly
                     try:
                         for part in chunk.candidates[0].content.parts:
                             if hasattr(part, 'text') and part.text:
@@ -651,24 +668,6 @@ class LLMClient:
 
             # Reconstruct final text
             full_text = "".join(text_parts).strip()
-
-            # Extract function_call from the accumulated response.
-            # After streaming completes, the chat history is updated by the SDK.
-            # We inspect the last chunk for function_call parts.
-            function_call = None
-            try:
-                if last_chunk and hasattr(last_chunk, 'candidates') and last_chunk.candidates:
-                    content = getattr(last_chunk.candidates[0], 'content', None)
-                    if content and hasattr(content, 'parts') and content.parts:
-                        for part in content.parts:
-                            fc = getattr(part, 'function_call', None)
-                            if fc and getattr(fc, 'name', None):
-                                fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
-                                function_call = {"action": fc.name, "args": fc_args}
-                                log.info(f"Stream: native function_call detected: {fc.name}")
-                                break
-            except Exception as e:
-                log.debug(f"Stream function_call extraction failed: {e}")
 
             # Fallback: check text-based TOOL_CALL: pattern
             if not function_call and full_text:
@@ -719,10 +718,26 @@ class LLMClient:
         try:
             stream = self._call_with_rotation(_do)
             text_parts: List[str] = []
-            last_chunk = None
+            function_call = None  # Scan ALL chunks
 
             for chunk in stream:
-                last_chunk = chunk
+                # ── Check EVERY chunk for function_call ──────────────────
+                if not function_call:
+                    try:
+                        if hasattr(chunk, 'candidates') and chunk.candidates:
+                            content = getattr(chunk.candidates[0], 'content', None)
+                            if content and hasattr(content, 'parts') and content.parts:
+                                for part in content.parts:
+                                    fc = getattr(part, 'function_call', None)
+                                    if fc and getattr(fc, 'name', None):
+                                        fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
+                                        function_call = {"action": fc.name, "args": fc_args}
+                                        log.info(f"Stream tool result: native function_call: {fc.name}")
+                                        break
+                    except Exception as e:
+                        log.debug(f"Stream tool result function_call check: {e}")
+
+                # ── Extract text delta ───────────────────────────────────
                 delta = ""
                 try:
                     delta = chunk.text or ""
@@ -740,22 +755,6 @@ class LLMClient:
                         on_chunk(delta)
 
             full_text = "".join(text_parts).strip()
-
-            # Extract function_call from last chunk
-            function_call = None
-            try:
-                if last_chunk and hasattr(last_chunk, 'candidates') and last_chunk.candidates:
-                    content = getattr(last_chunk.candidates[0], 'content', None)
-                    if content and hasattr(content, 'parts') and content.parts:
-                        for part in content.parts:
-                            fc = getattr(part, 'function_call', None)
-                            if fc and getattr(fc, 'name', None):
-                                fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
-                                function_call = {"action": fc.name, "args": fc_args}
-                                log.info(f"Stream tool result: native function_call: {fc.name}")
-                                break
-            except Exception as e:
-                log.debug(f"Stream tool result function_call extraction failed: {e}")
 
             if not function_call and full_text:
                 function_call = self._parse_tool_call(full_text)
