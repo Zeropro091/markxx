@@ -9,7 +9,7 @@ if os.name == 'nt':
 from textual import work, on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Footer, Input, RichLog, Static, Button, Label, Select, Checkbox
+from textual.widgets import Header, Footer, Input, RichLog, Static, Button, Label, Select, Checkbox, TextArea
 from textual.reactive import reactive
 from textual.binding import Binding
 from textual.screen import Screen
@@ -21,6 +21,68 @@ from core.llm import LLMClient
 from core.memory import Memory
 from agent.cli_planner import CLIPlanner
 from core.scheduler import JobScheduler
+
+def get_clipboard_text() -> str:
+    """Read text from clipboard. Uses PowerShell for reliability in alt-screen terminals."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        return result.stdout.rstrip("\r\n") if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def set_clipboard_text(text: str) -> bool:
+    """Copy text to clipboard. Uses PowerShell for reliability in alt-screen terminals."""
+    if not text:
+        return False
+    try:
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Set-Clipboard", "-Value", text],
+            capture_output=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        return True
+    except Exception:
+        return False
+
+
+class ClipboardMixin:
+    """Mixin that adds Ctrl+V paste and Ctrl+C copy to any Screen or App.
+
+    Screens using this mixin should declare bindings with priority=True:
+        Binding("ctrl+v", "paste_clipboard", "Paste", show=False, priority=True),
+        Binding("ctrl+c", "copy_clipboard", "Copy", show=False, priority=True),
+    """
+
+    def action_paste_clipboard(self) -> None:
+        focused = self.focused
+        if isinstance(focused, (Input, TextArea)):
+            text = get_clipboard_text()
+            if text:
+                if isinstance(focused, Input):
+                    val = focused.value
+                    cursor = focused.cursor_position
+                    focused.value = val[:cursor] + text + val[cursor:]
+                    focused.cursor_position = cursor + len(text)
+                elif isinstance(focused, TextArea):
+                    focused.insert(text)
+
+    def action_copy_clipboard(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            text = focused.value
+            if text:
+                set_clipboard_text(text)
+        elif isinstance(focused, TextArea):
+            text = focused.selected_text if hasattr(focused, 'selected_text') else ""
+            if text:
+                set_clipboard_text(text)
 
 
 class SidebarInfo(Static):
@@ -41,6 +103,7 @@ class SidebarInfo(Static):
         parts = [
             ("⚙️ SYSTEM STATUS\n", "bold magenta"),
             (f"Model: {self.settings.gemini_model}\n", "cyan"),
+            (f"API keys: {len(self.settings.get_all_keys())} (rotation pool)\n", "dim"),
             (f"Mode: {self.mode}\n", "green" if self.mode == "YOLO" else "yellow"),
             (f"Dir: {self.working_dir}\n", "dim"),
             ("\n", ""),
@@ -74,11 +137,13 @@ TIER_MODELS = {
 }
 
 
-class SettingsScreen(Screen):
+class SettingsScreen(ClipboardMixin, Screen):
     """Screen for modifying CLI and LLM settings."""
 
     BINDINGS = [
         Binding("escape", "dismiss", "Go Back", show=True),
+        Binding("ctrl+v", "paste_clipboard", "Paste", show=False, priority=True),
+        Binding("ctrl+c", "copy_clipboard", "Copy", show=False, priority=True),
     ]
 
     def __init__(self, settings, **kwargs):
@@ -96,6 +161,11 @@ class SettingsScreen(Screen):
         yield Header(show_clock=True)
         with VerticalScroll(id="settings-form"):
             yield Static("⚙️ TECHNICAL CLI SETTINGS", classes="settings-title")
+
+            yield Label("Gemini API Keys (one per line, first = primary):")
+            yield TextArea("\n".join([self.settings.gemini_api_key] + self.settings.gemini_api_keys), id="setting-api-keys", language=None)
+            # Button to add a single API key dynamically
+            yield Button("+ Add API Key", variant="primary", id="btn-add-key")
 
             yield Label("Model Tier:")
             yield Select(
@@ -150,9 +220,30 @@ class SettingsScreen(Screen):
     def cancel_pressed(self) -> None:
         self.dismiss(None)
 
+    @on(Button.Pressed, "#btn-add-key")
+    def add_key_pressed(self) -> None:
+        def after_add(new_key):
+            if new_key:
+                # Update the API keys textarea to reflect added key
+                ta = self.query_one("#setting-api-keys", TextArea)
+                keys = [self.settings.gemini_api_key] + self.settings.gemini_api_keys
+                ta.load_text("\n".join(keys))
+        self.push_screen(AddApiKeyScreen(self.settings), after_add)
+
     @on(Button.Pressed, "#btn-save")
     def save_pressed(self) -> None:
         try:
+            # Retrieve multiline API keys from TextArea
+            raw_keys = self.query_one("#setting-api-keys", TextArea).text.strip()
+            # Split by newlines and commas, allowing both formats
+            keys = [k.strip() for line in raw_keys.split('\n') for k in line.split(',') if k.strip()]
+            # Validate keys (simple check for length)
+            for k in keys:
+                if len(k) < 10:
+                    raise ValueError(f"API key too short: {k[:12]}...")
+            # Update settings: primary key is first if exists, else empty string
+            self.settings.gemini_api_key = keys[0] if keys else ""
+            self.settings.gemini_api_keys = keys[1:] if len(keys) > 1 else []
             self.settings.gemini_model = self.query_one("#setting-model", Select).value
             self.settings.cli_max_steps = int(self.query_one("#setting-steps", Input).value.strip())
             self.settings.cli_max_result_len = int(self.query_one("#setting-result-len", Input).value.strip())
@@ -165,14 +256,67 @@ class SettingsScreen(Screen):
 
             self.dismiss(self.settings)
         except Exception as e:
-            pass
+            # Show error in chat log and keep screen open for correction
+            self.app.chat.write(Text(f"❌ Error saving settings: {e}", style="bold red"))
 
+    class AddApiKeyScreen(ClipboardMixin, Screen):
+        """Screen to add a single API key."""
+        BINDINGS = [
+            Binding("escape", "dismiss", "Cancel", show=True),
+            Binding("ctrl+v", "paste_clipboard", "Paste", show=False, priority=True),
+            Binding("ctrl+c", "copy_clipboard", "Copy", show=False, priority=True),
+        ]
 
-class SchedulerScreen(Screen):
+        def __init__(self, settings, **kwargs):
+            super().__init__(**kwargs)
+            self.settings = settings
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=True)
+            yield Static("Add Gemini API Key", classes="settings-title")
+            yield Input(placeholder="Enter new API key", id="new-api-key")
+            with Horizontal(classes="buttons-row"):
+                yield Button("Save", variant="primary", id="add-key-save")
+                yield Button("Cancel", variant="error", id="add-key-cancel")
+            yield Footer()
+
+        @on(Button.Pressed, "#add-key-cancel")
+        def cancel(self) -> None:
+            self.dismiss(None)
+
+        @on(Button.Pressed, "#add-key-save")
+        def save(self) -> None:
+            new_key = self.query_one("#new-api-key", Input).value.strip()
+            # Simple validation for API key format
+            if new_key and len(new_key) < 10:
+                # Show error message in the main chat
+                self.app.chat.write(Text(f"❌ API key too short: {new_key}", style="bold red"))
+                self.dismiss(None)
+                return
+            if new_key:
+                try:
+                    existing = self.settings.get_all_keys()
+                    if new_key in existing:
+                        self.app.chat.write(Text("⚠ That API key is already in the pool.", style="bold yellow"))
+                        self.dismiss(None)
+                        return
+                    self.settings.gemini_api_keys.append(new_key)
+                    from config.settings import save_settings
+                    save_settings(self.settings)
+                    self.dismiss(new_key)
+                except Exception as e:
+                    self.app.chat.write(Text(f"❌ Error adding API key: {e}", style="bold red"))
+                    self.dismiss(None)
+            else:
+                self.dismiss(None)
+
+class SchedulerScreen(ClipboardMixin, Screen):
     """Screen for managing scheduled automation jobs."""
 
     BINDINGS = [
         Binding("escape", "dismiss", "Go Back", show=True),
+        Binding("ctrl+v", "paste_clipboard", "Paste", show=False, priority=True),
+        Binding("ctrl+c", "copy_clipboard", "Copy", show=False, priority=True),
     ]
 
     def __init__(self, settings, **kwargs):
@@ -275,7 +419,7 @@ class SchedulerScreen(Screen):
         self.dismiss(None)
 
 
-class MarkTUI(App):
+class MarkTUI(ClipboardMixin, App):
     """MARK-XX Interactive Chat TUI."""
 
     TITLE = "MARK-XX CLI Agent"
@@ -375,6 +519,12 @@ class MarkTUI(App):
     .buttons-row Button {
         margin: 0 2;
     }
+
+    #setting-api-keys {
+        height: 6;
+        border: tall #26262b;
+        background: #141416;
+    }
     """
 
     BINDINGS = [
@@ -383,6 +533,8 @@ class MarkTUI(App):
         Binding("ctrl+r", "resume_session", "Resume", show=True),
         Binding("ctrl+s", "show_settings", "Settings", show=True),
         Binding("ctrl+j", "show_scheduler", "Scheduler", show=True),
+        Binding("ctrl+v", "paste_clipboard", "Paste", show=False, priority=True),
+        Binding("ctrl+c", "interrupt_or_copy", "Stop/Copy", show=True, priority=True),
     ]
 
     def __init__(self, planner: CLIPlanner, settings, working_dir: str):
@@ -414,6 +566,18 @@ class MarkTUI(App):
 
         self.update_sidebar()
         self.input_box.focus()
+
+        def _on_key_rotated(key, slot, total, reason):
+            short = (key[:8] + "…") if key else "?"
+            if reason == "single key — add more keys for rotation":
+                msg = "\n⚠ Rate limit — only 1 API key. Add more in Settings for rotation.\n"
+            elif reason == "cooldown retry":
+                msg = f"\n⏳ All keys rate-limited. Retrying with key 1/{total} after cooldown…\n"
+            else:
+                msg = f"\n⚡ Rate limit — switched to API key {slot}/{total} ({short})\n"
+            self.call_from_thread(self.chat.write, Text(msg, style="bold yellow"))
+
+        self.planner.llm.on_key_rotated = _on_key_rotated
 
         # Check for scheduled jobs every 30 seconds
         self.set_interval(30, self.check_scheduled_jobs)
@@ -471,6 +635,53 @@ class MarkTUI(App):
             self.call_from_thread(self.input_box.focus)
 
     # ── Actions ──────────────────────────────────────────────────────────────
+    def action_interrupt_or_copy(self) -> None:
+        """Ctrl+C: copy from focused input, or interrupt running agent."""
+        focused = self.focused
+        if isinstance(focused, Input):
+            text = focused.value
+            if text:
+                set_clipboard_text(text)
+                self.chat.write(Text("📋 Copied to clipboard.", style="dim"))
+            return
+        if isinstance(focused, TextArea):
+            text = focused.selected_text if hasattr(focused, 'selected_text') else ""
+            if text:
+                set_clipboard_text(text)
+                self.chat.write(Text("📋 Copied to clipboard.", style="dim"))
+            return
+        # Nothing focused → interrupt running agent
+        workers = self.workers
+        cancelled = False
+        for worker in workers:
+            if not worker.is_finished:
+                worker.cancel()
+                cancelled = True
+        if cancelled:
+            self.chat.write(Text("\n⛔ Agent interrupted.", style="bold yellow"))
+            self.sidebar.status_text = "Ready"
+            self.sidebar.refresh()
+
+    def on_mouse_up(self, event) -> None:
+        if event.button == 3:  # Right-click
+            try:
+                widget = self.get_widget_at(event.screen_x, event.screen_y)[0]
+            except Exception:
+                widget = None
+            target = widget if isinstance(widget, (Input, TextArea)) else self.focused
+            if isinstance(target, (Input, TextArea)):
+                text = get_clipboard_text()
+                if text:
+                    if isinstance(target, Input):
+                        val = target.value
+                        cursor = target.cursor_position
+                        target.value = val[:cursor] + text + val[cursor:]
+                        target.cursor_position = cursor + len(text)
+                        target.focus()
+                    elif isinstance(target, TextArea):
+                        target.insert(text)
+                        target.focus()
+
     def action_clear_chat(self) -> None:
         self.chat.clear()
         self.chat.write(Text("⚡ Chat cleared.", style="dim"))
@@ -524,9 +735,26 @@ class MarkTUI(App):
                 self.planner.jail.forbidden_patterns = self.settings.cli_forbidden_patterns
                 self.planner.interceptor.dangerous_tools = set(self.settings.cli_dangerous_tools)
                 self.planner.settings.cli_enable_self_evolution = self.settings.cli_enable_self_evolution
-                
+
+                # Reconfigure LLM client with updated key pool
+                all_keys = self.settings.get_all_keys()
+                if all_keys:
+                    self.planner.llm.configure(
+                        api_key=all_keys[0],
+                        model=self.settings.gemini_model,
+                        extra_keys=all_keys[1:] if len(all_keys) > 1 else [],
+                    )
+                    n = len(all_keys)
+                    self.chat.write(
+                        Text(
+                            f"\n⚙️ Settings saved — {n} API key{'s' if n != 1 else ''} in rotation pool.",
+                            style="bold green",
+                        )
+                    )
+                else:
+                    self.chat.write(Text("\n⚙️ Settings saved (no API keys — add at least one).", style="bold yellow"))
+
                 self.update_sidebar()
-                self.chat.write(Text("\n⚙️ Settings saved successfully.", style="bold green"))
             self.input_box.focus()
 
         self.push_screen(SettingsScreen(self.settings), update_after_settings)

@@ -61,6 +61,11 @@ class Settings:
     # ── Paths ─────────────────────────────────────────────────────────────────
     memory_db: str = ""
 
+    # ── Multimodal Live (WebSocket Audio Streaming) ─────────────────────────
+    multimodal_live_mode: bool = False     # True → bypass Whisper/TTS, use Gemini Live WebSocket
+    live_model: str = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    live_voice: str = "Charon"
+
     # ── CLI Power User Configs ────────────────────────────────────────────────
     cli_max_steps:              int       = 15
     cli_max_result_len:         int       = 4000
@@ -100,7 +105,7 @@ def load_settings() -> Settings:
                 
                 # Write to cli_settings.json so it is saved separately
                 save_settings(s)
-                return s
+                return _apply_env_keys(s)
             except Exception:
                 pass
 
@@ -112,14 +117,72 @@ def load_settings() -> Settings:
             for k, v in data.items():
                 if hasattr(s, k):
                     setattr(s, k, v)
-            return s
+            # Sync API keys from user_settings.json if in CLI mode
+            if os.getenv("MARK_CLI") == "1":
+                user_path = Path(__file__).parent.parent / "config" / "user_settings.json"
+                if user_path.exists():
+                    try:
+                        with open(user_path, "r") as f:
+                            u_data = json.load(f)
+                        if "gemini_api_key" in u_data:
+                            s.gemini_api_key = u_data["gemini_api_key"]
+                        if "gemini_api_keys" in u_data:
+                            s.gemini_api_keys = u_data["gemini_api_keys"]
+                    except Exception:
+                        pass
+            return _apply_env_keys(s)
         except Exception:
             pass
-    return Settings()
+    return _apply_env_keys(Settings())
+
+
+def _apply_env_keys(s: Settings) -> Settings:
+    """Override API keys from environment variables if set.
+    
+    Supports:
+        GEMINI_API_KEY   — single primary key
+        GEMINI_API_KEYS  — comma-separated list of extra keys
+    """
+    env_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if env_key:
+        s.gemini_api_key = env_key
+
+    env_keys = os.getenv("GEMINI_API_KEYS", "").strip()
+    if env_keys:
+        s.gemini_api_keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+
+    return s
 
 
 def save_settings(settings: Settings) -> None:
     config_path = _get_config_path()
+    print(f"DEBUG: Saving settings to {config_path}")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
         json.dump(asdict(settings), f, indent=2)
+    print(f"DEBUG: Settings saved successfully to {config_path}")
+
+    # Sync API keys to the other settings file to keep them in sync
+    try:
+        user_path = Path(__file__).parent.parent / "config" / "user_settings.json"
+        cli_path = Path(__file__).parent.parent / "config" / "cli_settings.json"
+        if os.getenv("MARK_CLI") == "1":
+            # Synced from CLI -> UI
+            if user_path.exists():
+                with open(user_path, "r") as f:
+                    u_data = json.load(f)
+                u_data["gemini_api_key"] = settings.gemini_api_key
+                u_data["gemini_api_keys"] = settings.gemini_api_keys
+                with open(user_path, "w") as f:
+                    json.dump(u_data, f, indent=2)
+        else:
+            # Synced from UI -> CLI
+            if cli_path.exists():
+                with open(cli_path, "r") as f:
+                    c_data = json.load(f)
+                c_data["gemini_api_key"] = settings.gemini_api_key
+                c_data["gemini_api_keys"] = settings.gemini_api_keys
+                with open(cli_path, "w") as f:
+                    json.dump(c_data, f, indent=2)
+    except Exception:
+        pass

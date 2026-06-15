@@ -27,13 +27,21 @@ from actions.file_handler import extract_text, get_image_bytes, get_image_mime, 
 
 log = get_logger("planner")
 
-MAX_STEPS       = 10   # max tool calls per request
+MAX_STEPS       = 20   # max tool calls per request
 MAX_RESULT_LEN  = 3000  # truncate long tool results
+
+
+# ── Knowledge Base ────────────────────────────────────────────────────────────
+try:
+    from core.knowledge import get_knowledge_base
+    _kb = get_knowledge_base()
+except Exception:
+    _kb = None
 
 
 # ── Load .gemini context once at import ───────────────────────────────────────
 def _load_gemini_context() -> str:
-    """Load GEMINI.md persona and user profile for injection into system prompt."""
+    """Load GEMINI.md persona, user profile, shared session, and knowledge base."""
     parts = []
 
     gemini_md = GEMINI_DIR / "GEMINI.md"
@@ -63,6 +71,15 @@ def _load_gemini_context() -> str:
         except Exception:
             pass
 
+    # Load knowledge base context
+    if _kb:
+        try:
+            kb_summary = _kb.get_context_summary()
+            if kb_summary:
+                parts.append(kb_summary)
+        except Exception:
+            pass
+
     return "\n\n---\n\n".join(parts) if parts else ""
 
 
@@ -82,35 +99,31 @@ You have direct access to their system and can execute tools to complete tasks.
 ## How You Work
 You operate in a ReAct loop:
 1. THINK about what needs to be done
-2. ACT by calling one tool at a time (emit JSON)
+2. ACT by calling one tool at a time
 3. OBSERVE the result
 4. Repeat until the task is complete
 5. Give a final natural language response
 
 ## Tool Calling
-When you need to perform an action, emit EXACTLY one JSON object on its own line starting with TOOL_CALL: like this (no markdown fences):
-TOOL_CALL: {{"action": "tool_name", "args": {{"key": "value"}}}}
-Only emit ONE tool call per response. After seeing the result, decide the next step.
-When done, respond naturally without a TOOL_CALL: line.
+You have access to tools via function calling. Call tools directly when you need to perform an action.
+Only call ONE tool per response. After seeing the result, decide the next step.
+When done, respond naturally without calling a tool.
 
 ## Rules
 - Be autonomous: don't ask for confirmation on simple tasks, just do them
 - Be efficient: chain tools to complete complex tasks
-- Be transparent: briefly explain what you're doing before each tool call
 - When writing files, use absolute paths
 - For commands, prefer PowerShell on Windows
+- NEVER say "I will..." or "I am going to..." — call the tool IMMEDIATELY
+- If you need data, call the tool right away without announcing your intention
+- Do not describe what you plan to do — just DO it
 
 ## Voice Output (TTS)
 Your text responses are read aloud by a text-to-speech engine. Follow these rules:
 - Speak conversationally, like you're talking to a friend — not writing a textbook
 - Never write code examples in your final response unless the user explicitly asks for code
-- Instead of "An SDK (Software Development Kit) is...", say "An SDK is basically a developer's toolkit that..."
-- Don't use parenthetical abbreviations like (API) or (SDK) — just use the term naturally
 - Avoid bullet-point lists when a short paragraph works
-- If you need to explain something technical, use analogies and simple language
 - Keep responses concise — long responses are painful to listen to
-
-{tool_descriptions}
 """
 
 
@@ -137,7 +150,6 @@ class PlannerWorker(QThread):
         prompt = SYSTEM_PROMPT.format(
             gemini_context=gemini_ctx,
             memory_context=memory_ctx or "No prior context.",
-            tool_descriptions=TOOL_DESCRIPTIONS,
         )
         self.llm.update_system_prompt(prompt)
 
@@ -188,13 +200,12 @@ class PlannerWorker(QThread):
                 # Call LLM
                 if current_image:
                     raw, tool_call = self.llm.chat_with_image(current_message, current_image, current_mime)
-                    current_image = None   # image only on first call
+                    current_image = None
                 else:
                     raw, tool_call = self.llm.chat(current_message)
 
                 log.info(f"Step {steps}: tool={tool_call.get('action') if tool_call else None} | {len(raw)} chars")
 
-                # Handle empty/blocked responses
                 if not raw and not tool_call:
                     log.warning(f"Step {steps}: empty response (possible safety filter)")
                     accumulated_response = (
@@ -204,74 +215,91 @@ class PlannerWorker(QThread):
                     break
 
                 if not tool_call:
-                    # No more tools — this is the final answer
                     accumulated_response = raw
                     break
 
-                # ── Execute the tool ──────────────────────────────────────────
-                action = tool_call.get("action", "")
-                args   = tool_call.get("args", {})
+                # ── Tool execution + chaining loop ────────────────────────────
+                while tool_call and steps < MAX_STEPS:
+                    action = tool_call.get("action", "")
+                    args   = tool_call.get("args", {})
 
-                # Memory shortcuts handled locally
-                if action == "remember":
-                    key, val = args.get("key",""), args.get("value","")
-                    self.memory.set_pref(key, val)
-                    tool_result = f"Stored: {key} = {val}"
-                    self.tool_executed.emit("🧠 Remember", tool_result)
+                    if action == "remember":
+                        key, val = args.get("key",""), args.get("value","")
+                        self.memory.set_pref(key, val)
+                        tool_result = f"Stored: {key} = {val}"
+                        self.tool_executed.emit("🧠 Remember", tool_result)
 
-                elif action == "recall":
-                    key = args.get("key","")
-                    val = self.memory.get_pref(key, "(not found)")
-                    tool_result = f"{key}: {val}"
-                    self.tool_executed.emit("🧠 Recall", tool_result)
+                    elif action == "recall":
+                        key = args.get("key","")
+                        val = self.memory.get_pref(key, "(not found)")
+                        tool_result = f"{key}: {val}"
+                        self.tool_executed.emit("🧠 Recall", tool_result)
 
-                elif action == "take_screenshot":
-                    img = get_screen_thumbnail()
-                    if img:
-                        # Feed screenshot back to LLM in next step
-                        tool_result = "[screenshot captured — analyzing…]"
-                        current_image = img
-                        current_mime  = "image/png"
+                    elif action == "take_screenshot":
+                        img = get_screen_thumbnail()
+                        if img:
+                            tool_result = "[screenshot captured — analyzing…]"
+                            current_image = img
+                            current_mime  = "image/png"
+                        else:
+                            tool_result = "Could not capture screenshot."
+                        self.tool_executed.emit("📸 Screenshot", "Captured.")
+
+                    elif action == "capture_webcam":
+                        img = capture_webcam()
+                        if img:
+                            tool_result = "[webcam captured — analyzing…]"
+                            current_image = img
+                            current_mime  = "image/jpeg"
+                        else:
+                            tool_result = "Could not capture webcam."
+                        self.tool_executed.emit("📷 Webcam", "Captured.")
+
                     else:
-                        tool_result = "Could not capture screenshot."
-                    self.tool_executed.emit("📸 Screenshot", "Captured.")
+                        tool_result = execute_tool(action, args)
+                        icon_map = {
+                            "run_command":"⚡","read_file":"📄","write_file":"📝",
+                            "list_files":"📋","open_app":"🚀","type_text":"⌨️",
+                            "open_file":"📂","web_search":"🔍","remember_note":"🧠",
+                            "recall_notes":"🔎","update_shared_session":"🔄",
+                            "read_user_profile":"👤",
+                        }
+                        icon = icon_map.get(action, "⚙️")
+                        summary = str(tool_result)[:120] + ("…" if len(str(tool_result)) > 120 else "")
+                        self.tool_executed.emit(f"{icon} {action}", summary)
 
-                elif action == "capture_webcam":
-                    img = capture_webcam()
-                    if img:
-                        tool_result = "[webcam captured — analyzing…]"
-                        current_image = img
-                        current_mime  = "image/jpeg"
-                    else:
-                        tool_result = "Could not capture webcam."
-                    self.tool_executed.emit("📷 Webcam", "Captured.")
+                    if len(str(tool_result)) > MAX_RESULT_LEN:
+                        tool_result = str(tool_result)[:MAX_RESULT_LEN] + "\n… [truncated]"
 
-                else:
-                    tool_result = execute_tool(action, args)
-                    icon_map = {
-                        "run_command":"⚡","read_file":"📄","write_file":"📝",
-                        "list_files":"📋","open_app":"🚀","type_text":"⌨️",
-                        "open_file":"📂","web_search":"🔍","remember_note":"🧠",
-                        "recall_notes":"🔎","update_shared_session":"🔄",
-                        "read_user_profile":"👤",
-                    }
-                    icon = icon_map.get(action, "⚙️")
-                    summary = str(tool_result)[:120] + ("…" if len(str(tool_result)) > 120 else "")
-                    self.tool_executed.emit(f"{icon} {action}", summary)
+                    # If the tool produced an image, break to outer loop for chat_with_image
+                    if current_image:
+                        current_message = f"Tool `{action}` produced an image. Analyze it."
+                        break
 
-                # Truncate very long results before feeding back
-                if len(str(tool_result)) > MAX_RESULT_LEN:
-                    tool_result = str(tool_result)[:MAX_RESULT_LEN] + "\n… [truncated]"
+                    # Feed result back via proper FunctionResponse
+                    steps += 1
+                    self.step_update.emit(f"Thinking… (step {steps})")
+                    raw, tool_call = self.llm.chat_tool_result(action, str(tool_result))
+                    log.info(f"Step {steps}: tool={tool_call.get('action') if tool_call else None} | {len(raw)} chars")
 
-                # Feed result back as next message
-                current_message = (
-                    f"Tool `{action}` returned:\n```\n{tool_result}\n```\n"
-                    f"Continue with the task. If done, give the final response without a tool call."
-                )
-                log.debug(f"Feeding result of '{action}' back to LLM")
+                    if not raw and not tool_call:
+                        accumulated_response = (
+                            "I'm sorry, my response was blocked by safety filters. "
+                            "Please try rephrasing your request."
+                        )
+                        break
+
+                    if not tool_call:
+                        accumulated_response = raw
+                        break
+
+                    log.debug(f"Chaining tool call: {tool_call.get('action')}")
+
+                # If we got a final answer from the inner loop, stop
+                if accumulated_response or (not raw and not tool_call):
+                    break
 
             else:
-                # Hit step limit
                 accumulated_response = (
                     "I've completed the maximum number of steps. Here's what I did:\n" +
                     accumulated_response

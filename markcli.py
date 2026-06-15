@@ -96,7 +96,7 @@ def main():
         BOLD = DIM = CYAN = GREEN = YELLOW = MAGENTA = RED = RESET = ""
 
     # ── Load settings ─────────────────────────────────────────────────────────
-    from config.settings import load_settings
+    from config.settings import load_settings, save_settings
     settings = load_settings()
     settings.memory_db = str(ROOT / "memory" / "markxx.db")
 
@@ -104,19 +104,39 @@ def main():
         settings.gemini_model = model
     if api_key_override:
         settings.gemini_api_key = api_key_override
+        log.warning("API key passed via --key flag is visible in process list. "
+                    "Prefer GEMINI_API_KEY env var for security.")
 
     # ── Check API key ─────────────────────────────────────────────────────────
     all_keys = settings.get_all_keys()
     if not all_keys or not all_keys[0].strip():
         print(f"\n{YELLOW}No Gemini API key configured.{RESET}")
-        print(f"Set it via: {BOLD}python markcli.py --key YOUR_KEY{RESET}")
-        print(f"Or configure it in the GUI Settings panel first.")
+        print(f"Set it via:  {BOLD}set GEMINI_API_KEY=YOUR_KEY{RESET}  (recommended)")
+        print(f"         or: {BOLD}python markcli.py --key YOUR_KEY{RESET}")
+        print(f"         or: configure it in the GUI Settings panel.")
         print()
-        key = input(f"Enter API key (or press Enter to quit): ").strip()
+        key = input(f"Enter primary API key (or press Enter to quit): ").strip()
         if not key:
             sys.exit(1)
         settings.gemini_api_key = key
-        all_keys = [key]
+
+        # Prompt for extra keys (same as UI's multi-key support)
+        print(f"\n{DIM}Optionally, add extra API keys for automatic rotation on quota limits.{RESET}")
+        print(f"{DIM}Enter one key per line. Press Enter on an empty line to finish.{RESET}\n")
+        extra_keys = []
+        while True:
+            ek = input(f"  Extra key {len(extra_keys) + 1} (or blank to skip): ").strip()
+            if not ek:
+                break
+            if ek != key:
+                extra_keys.append(ek)
+        if extra_keys:
+            settings.gemini_api_keys = extra_keys
+
+        save_settings(settings)
+        all_keys = settings.get_all_keys()
+        total = len(all_keys)
+        print(f"{GREEN}{total} key{'s' if total != 1 else ''} saved to config.{RESET}")
 
     # ── Initialize components ─────────────────────────────────────────────────
     from core.llm import LLMClient
@@ -125,12 +145,12 @@ def main():
 
     memory = Memory(settings.memory_db)
     llm_client = LLMClient(
-        api_key=all_keys[0],
+        api_key=all_keys[0] if all_keys else "",
         model=settings.gemini_model,
         system_prompt="",
         extra_keys=all_keys[1:] if len(all_keys) > 1 else [],
         temperature=settings.llm_temperature,
-        max_tokens=None,  # None means unlimited (restricted only by model default max output limits)
+        max_tokens=None,  # None = model default max output (no explicit cap)
     )
 
     # Resolve working directory
@@ -151,6 +171,18 @@ def main():
         app = MarkTUI(planner, settings, working_dir)
         app.run()
         sys.exit(0)
+
+    # Classic REPL: print rotation notices to the terminal
+    def _on_key_rotated(key, slot, total, reason):
+        display_key = key[:8] + "..." if key else "None"
+        if reason == "single key — add more keys for rotation":
+            print(f"\n  {YELLOW}{BOLD}⚠ Rate limit — only 1 API key. Add more in Settings for rotation.{RESET}\n")
+        elif reason == "cooldown retry":
+            print(f"\n  {YELLOW}{BOLD}⏳ All keys rate-limited. Retrying with key 1/{total} after cooldown…{RESET}\n")
+        else:
+            print(f"\n  {YELLOW}{BOLD}⚡ Rate limit hit. Rotated API key to slot {slot}/{total} ({display_key}){RESET}\n")
+
+    llm_client.on_key_rotated = _on_key_rotated
 
     # ── Print banner ──────────────────────────────────────────────────────────
     mode_label = {"auto": "YOLO", "normal": "Normal", "strict": "Strict"}[mode]
@@ -201,6 +233,12 @@ def main():
   {BOLD}Commands:{RESET}
     /help             Show this help
     /quit             Exit MARK CLI
+    /undo             Revert last MARK edit (git checkpoint rollback)
+    /index            Index codebase for semantic search
+    /plan             Enter plan mode (read-only exploration)
+    /build            Exit plan mode (enable all tools)
+    /compact          Compact conversation context (save tokens)
+    /context          Show context stats
     /resume           Resume last interrupted session
     /model NAME       Switch to a different model
     /mode MODE        Change safety mode (auto/normal/strict)
@@ -227,10 +265,15 @@ def main():
                 else:
                     new_model = parts[1].strip()
                     settings.gemini_model = new_model
+                    save_settings(settings)
+                    fresh_keys = settings.get_all_keys()
+                    if not fresh_keys:
+                        print(f"  {RED}No API keys configured.{RESET}")
+                        continue
                     llm_client.configure(
-                        api_key=all_keys[0],
+                        api_key=fresh_keys[0],
                         model=new_model,
-                        extra_keys=all_keys[1:] if len(all_keys) > 1 else [],
+                        extra_keys=fresh_keys[1:] if len(fresh_keys) > 1 else [],
                     )
                     print(f"  {GREEN}Switched to: {new_model}{RESET}")
                 continue
@@ -416,6 +459,57 @@ def main():
                         print(f"  {GREEN}Working directory: {working_dir}{RESET}")
                     else:
                         print(f"  {YELLOW}Directory not found: {new_dir}{RESET}")
+                continue
+
+            elif cmd == "/undo":
+                try:
+                    from core.git_checkpoint import undo_last_edit
+                    result = undo_last_edit(working_dir)
+                    print(f"  {result}")
+                except Exception as e:
+                    print(f"  {RED}Undo failed: {e}{RESET}")
+                continue
+
+            elif cmd == "/index":
+                try:
+                    from core.indexer import CodebaseIndexer
+                    print(f"  {DIM}Indexing codebase for semantic search...{RESET}")
+                    indexer = CodebaseIndexer(
+                        api_key=all_keys[0] if all_keys else "",
+                        db_path=str(Path(working_dir) / ".mark" / "index.db"),
+                    )
+                    stats = indexer.index(working_dir, force=True)
+                    print(f"  {GREEN}Indexed {stats.get('indexed', 0)} chunks in {stats.get('time', '?')}s | Skipped: {stats.get('skipped', 0)}{RESET}")
+                except ImportError:
+                    print(f"  {YELLOW}Indexer not yet built. Coming soon.{RESET}")
+                except Exception as e:
+                    print(f"  {RED}Indexing failed: {e}{RESET}")
+                continue
+
+            elif cmd == "/plan":
+                planner.plan_mode = True
+                print(f"  {GREEN}📋 Plan mode activated — read-only exploration. Use /build to exit.{RESET}")
+                continue
+
+            elif cmd == "/build":
+                planner.plan_mode = False
+                print(f"  {GREEN}🔨 Build mode activated — all tools enabled.{RESET}")
+                continue
+
+            elif cmd == "/compact":
+                if planner.context.should_compact():
+                    summary = planner.context.compact()
+                    print(f"  {GREEN}Compacted. Context: ~{planner.context.total_tokens} tokens{RESET}")
+                else:
+                    print(f"  {DIM}No compaction needed yet (~{planner.context.total_tokens} tokens){RESET}")
+                continue
+
+            elif cmd == "/context":
+                stats = planner.context.stats()
+                print(f"  Context: {stats['history_messages']} messages, ~{stats['total_tokens']} tokens")
+                print(f"  Window: {stats['window_size']} | Max: {stats['max_tokens']} | Compacted: {stats['compacted']}")
+                if planner.plan_mode:
+                    print(f"  {YELLOW}📋 Plan mode active (read-only){RESET}")
                 continue
 
             else:

@@ -77,34 +77,39 @@ def main():
     )
 
     # ── Initialise TTS ───────────────────────────────────────────────────────
-    tts_worker = TTSWorker(
-        voice=settings.voice_name,
-        rate=settings.tts_rate,
-        volume=settings.tts_volume,
-    )
-    tts_worker.start()
-    log.info(f"TTS started — voice={settings.voice_name}")
+    tts_worker = None
+    if not getattr(settings, "multimodal_live_mode", False):
+        tts_worker = TTSWorker(
+            voice=settings.voice_name,
+            rate=settings.tts_rate,
+            volume=settings.tts_volume,
+        )
+        tts_worker.start()
+        log.info(f"TTS started — voice={settings.voice_name}")
 
     # ── Initialise STT (optional — requires faster-whisper) ──────────────────
     stt_worker = None
-    try:
-        from core.stt import STTWorker
-        stt_worker = STTWorker(
-            model_size=settings.stt_model_size,
-            language=settings.stt_language,
-            mic_sensitivity=settings.mic_sensitivity,
-            silence_hysteresis=settings.silence_hysteresis,
-            silence_gate_sec=settings.silence_gate_sec,
-        )
-        log.info(f"STT ready — model={settings.stt_model_size}, lang={settings.stt_language}")
-        # Don't start yet — user must press mic button
-    except ImportError:
-        log.warning("faster-whisper not installed — voice input disabled.")
+    if not getattr(settings, "multimodal_live_mode", False):
+        try:
+            from core.stt import STTWorker
+            stt_worker = STTWorker(
+                model_size=settings.stt_model_size,
+                language=settings.stt_language,
+                mic_sensitivity=settings.mic_sensitivity,
+                silence_hysteresis=settings.silence_hysteresis,
+                silence_gate_sec=settings.silence_gate_sec,
+            )
+            log.info(f"STT ready — model={settings.stt_model_size}, lang={settings.stt_language}")
+            # Don't start yet — user must press mic button
+        except ImportError:
+            log.warning("faster-whisper not installed — voice input disabled.")
 
     # ── Initialise Planner ───────────────────────────────────────────────────
-    planner = PlannerWorker(llm_client, memory)
-    planner.start()
-    log.info("Planner started")
+    planner = None
+    if not getattr(settings, "multimodal_live_mode", False):
+        planner = PlannerWorker(llm_client, memory)
+        planner.start()
+        log.info("Planner started")
 
     # ── Launch UI ────────────────────────────────────────────────────────────
     from ui import MarkWindow
@@ -138,9 +143,9 @@ def main():
     log.info("Shutting down…")
     if stt_worker and stt_worker.isRunning():
         stt_worker.stop()
-    if tts_worker.isRunning():
+    if tts_worker and tts_worker.isRunning():
         tts_worker.stop()
-    if planner.isRunning():
+    if planner and planner.isRunning():
         planner.stop()
 
     save_settings(settings)

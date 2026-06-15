@@ -4,6 +4,8 @@ All tools MARK can call in its agentic loop.
 Each tool is a function: (args: dict) -> str result
 """
 
+from core.tool_registry import ToolRegistry
+
 import os
 import subprocess
 import json
@@ -204,6 +206,95 @@ def tool_recall(args: dict) -> str:
     return f"recall:{args.get('key','')}"  # handled by planner
 
 
+def tool_browser_control(args: dict) -> str:
+    """Controls any web browser using Playwright automation."""
+    from actions.browser_control import browser_control
+    return browser_control(parameters=args)
+
+
+def tool_computer_control(args: dict) -> str:
+    """Perform a computer control action like typing, clicking, drag/drop, keyboard/mouse actions, screenshot, etc."""
+    from actions.computer_control import computer_control
+    return computer_control(parameters=args)
+
+
+def tool_computer_settings(args: dict) -> str:
+    """Modify computer settings like volume, brightness, dark mode, wifi, window positioning, or screen locks."""
+    from actions.computer_settings import computer_settings
+    return computer_settings(parameters=args)
+
+
+def tool_dev_agent(args: dict) -> str:
+    """Trigger a developer agent to plan, write, test, build, and debug software projects in a desktop sandbox."""
+    from actions.dev_agent import dev_agent
+    return dev_agent(parameters=args)
+
+
+def tool_file_processor(args: dict) -> str:
+    """Analyze, process, trim, transcribe, convert, compress, extract, or summarize files of various types (images, pdfs, audio, video, json, csv, docx, pptx, zip, code, etc.)."""
+    from actions.file_processor import file_processor
+    return file_processor(parameters=args)
+
+
+# ── Semantic Search (codebase indexing) ────────────────────────────────────────
+_indexer_instance = None
+
+def _get_indexer():
+    """Lazy-init the CodebaseIndexer using the current API key."""
+    global _indexer_instance
+    if _indexer_instance is None:
+        try:
+            from config.settings import load_settings
+            from core.indexer import CodebaseIndexer
+            settings = load_settings()
+            api_key = settings.gemini_api_key
+            if not api_key:
+                return None
+            _indexer_instance = CodebaseIndexer(
+                api_key=api_key,
+                db_path=os.path.join(os.getcwd(), ".mark", "index.db"),
+            )
+        except Exception as e:
+            log.error(f"Failed to init CodebaseIndexer: {e}")
+            return None
+    return _indexer_instance
+
+
+def tool_semantic_search(args: dict) -> str:
+    """Search the codebase using semantic similarity (embedding-based)."""
+    query = args.get("query", "")
+    top_k = int(args.get("top_k", 5))
+    if not query:
+        return "Error: no query provided"
+
+    indexer = _get_indexer()
+    if indexer is None:
+        return "Error: could not initialize indexer (no API key?)"
+
+    # Auto-index if stale or empty
+    cwd = os.getcwd()
+    try:
+        if indexer.is_stale(cwd):
+            log.info("Index stale — re-indexing codebase...")
+            stats = indexer.index(cwd)
+            log.info(f"Indexed: {stats}")
+    except Exception as e:
+        log.warning(f"Auto-index failed: {e}")
+
+    try:
+        results = indexer.search(query, top_k=top_k)
+        if not results:
+            return f"No results found for: {query}"
+        lines = []
+        for r in results:
+            lines.append(f"── {r.file}:{r.start_line}-{r.end_line} (score: {r.score}) ──")
+            lines.append(r.snippet)
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error during search: {e}"
+
+
 # ── CLI-extended tools ────────────────────────────────────────────────────────
 from agent.cli_tools import (
     tool_edit_file,
@@ -215,6 +306,10 @@ from agent.cli_tools import (
     tool_git_diff,
     tool_git_commit,
     tool_patch_file,
+    tool_read_many_files,
+    tool_shell_background,
+    tool_shell_status,
+    tool_shell_kill,
 )
 
 
@@ -222,63 +317,111 @@ from agent.cli_tools import (
 # Registry
 # ══════════════════════════════════════════════════════════════════════════════
 
-TOOLS: Dict[str, Callable] = {
-    "run_command":           tool_run_command,
-    "read_file":             tool_read_file,
-    "write_file":            tool_write_file,
-    "edit_file":             tool_edit_file,
-    "patch_file":            tool_patch_file,
-    "delete_file":           tool_delete_file,
-    "move_file":             tool_move_file,
-    "list_files":            tool_list_files,
-    "search_files":          tool_search_files,
-    "glob_files":            tool_glob_files,
-    "fetch_url":             tool_fetch_url,
-    "git_diff":              tool_git_diff,
-    "git_commit":            tool_git_commit,
-    "open_app":              tool_open_app,
-    "type_text":             tool_type_text,
-    "open_file":             tool_open_file,
-    "take_screenshot":       tool_take_screenshot,
-    "web_search":            tool_web_search,
-    "remember_note":         tool_remember_note,
-    "recall_notes":          tool_recall_notes,
-    "read_user_profile":     tool_read_user_profile,
-    "update_shared_session": tool_update_shared_session,
-    "remember":              tool_remember,
-    "recall":                tool_recall,
-    "self_evolve":           lambda args: "self_evolve_handled_by_planner",
-}
+registry = ToolRegistry()
+
+# ── Shell / System (read-write) ───────────────────────────────────────────────
+registry.register("run_command",       tool_run_command,       category="system")
+registry.register("open_app",          tool_open_app,          category="system")
+registry.register("type_text",         tool_type_text,         category="system")
+registry.register("open_file",         tool_open_file,         category="system")
+registry.register("take_screenshot",   tool_take_screenshot,   category="system")
+
+# ── File Operations ───────────────────────────────────────────────────────────
+registry.register("read_file",         tool_read_file,         category="file", read_only=True)
+registry.register("write_file",        tool_write_file,        category="file")
+registry.register("edit_file",         tool_edit_file,         category="file")
+registry.register("patch_file",        tool_patch_file,        category="file")
+registry.register("delete_file",       tool_delete_file,       category="file")
+registry.register("move_file",         tool_move_file,         category="file")
+registry.register("list_files",        tool_list_files,        category="file", read_only=True)
+registry.register("search_files",      tool_search_files,      category="file", read_only=True)
+registry.register("glob_files",        tool_glob_files,        category="file", read_only=True)
+registry.register("read_many_files",   tool_read_many_files,   category="file", read_only=True)
+
+# ── Network / Web ─────────────────────────────────────────────────────────────
+registry.register("fetch_url",         tool_fetch_url,         category="web",  read_only=True)
+registry.register("web_search",        tool_web_search,        category="web",  read_only=True)
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+registry.register("git_diff",          tool_git_diff,          category="git",  read_only=True)
+registry.register("git_commit",        tool_git_commit,        category="git")
+
+# ── Browser / Computer / Settings ─────────────────────────────────────────────
+registry.register("browser_control",   tool_browser_control,   category="automation")
+registry.register("computer_control",  tool_computer_control,  category="automation")
+registry.register("computer_settings", tool_computer_settings, category="automation")
+
+# ── Agent ─────────────────────────────────────────────────────────────────────
+registry.register("dev_agent",         tool_dev_agent,         category="agent")
+registry.register("file_processor",    tool_file_processor,    category="agent")
+
+# ── Semantic Search ───────────────────────────────────────────────────────────
+registry.register("semantic_search",   tool_semantic_search,   category="search", read_only=True)
+
+# ── Background Shell ──────────────────────────────────────────────────────────
+registry.register("shell_background",  tool_shell_background,  category="system")
+registry.register("shell_status",      tool_shell_status,      category="system", read_only=True)
+registry.register("shell_kill",        tool_shell_kill,        category="system")
+
+# ── Memory / Notes / Session ──────────────────────────────────────────────────
+registry.register("remember_note",         tool_remember_note,         category="memory")
+registry.register("recall_notes",          tool_recall_notes,          category="memory", read_only=True)
+registry.register("read_user_profile",     tool_read_user_profile,     category="memory", read_only=True)
+registry.register("update_shared_session", tool_update_shared_session, category="memory")
+registry.register("self_evolve",           lambda args: "self_evolve_handled_by_planner", category="meta")
+
 
 # ── Optional note-taking tools ────────────────────────────────────────────────
 try:
     from actions.notes import (
-        note_list, note_read, note_search, note_create,
-        note_update, note_delete, note_graph, note_backlinks,
+        note_list, note_read, note_search, note_search_semantic,
+        note_create, note_update, note_delete, note_rename,
+        note_graph, note_backlinks, note_get_context, note_get_projects,
     )
-    TOOLS.update({
-        "note_list":      note_list,
-        "note_read":      note_read,
-        "note_search":    note_search,
-        "note_create":    note_create,
-        "note_update":    note_update,
-        "note_delete":    note_delete,
-        "note_graph":     note_graph,
-        "note_backlinks": note_backlinks,
-    })
+    # Read-only note tools
+    registry.register("note_list",            note_list,            category="notes", read_only=True)
+    registry.register("note_read",            note_read,            category="notes", read_only=True)
+    registry.register("note_search",          note_search,          category="notes", read_only=True)
+    registry.register("note_search_semantic", note_search_semantic, category="notes", read_only=True)
+    registry.register("note_graph",           note_graph,           category="notes", read_only=True)
+    registry.register("note_backlinks",       note_backlinks,       category="notes", read_only=True)
+    registry.register("note_get_context",     note_get_context,     category="notes", read_only=True)
+    registry.register("note_get_projects",    note_get_projects,    category="notes", read_only=True)
+    # Read-write note tools
+    registry.register("note_create",          note_create,          category="notes")
+    registry.register("note_update",          note_update,          category="notes")
+    registry.register("note_delete",          note_delete,          category="notes")
+    registry.register("note_rename",          note_rename,          category="notes")
     _NOTES_AVAILABLE = True
 except (ImportError, SyntaxError, Exception):
     _NOTES_AVAILABLE = False
 
+
+# ── LSP (Language Server Protocol) ────────────────────────────────────────────
+try:
+    from core.lsp import tool_lsp
+    registry.register("lsp", tool_lsp, category="search", read_only=True)
+except (ImportError, Exception):
+    pass
+
+
+# ── Backward-compatible TOOLS dict ────────────────────────────────────────────
+TOOLS: Dict[str, Callable] = registry.tools
+
+
 _NOTES_DESCRIPTION = """
-note_list        {}                                                   -- list all notes
-note_read        {"id":"<note_id>"}                                   -- read a note (returns content + metadata)
-note_search      {"query":"<search term>"}                            -- search notes by content
-note_create      {"id":"<path>","title":"<Title>"}                   -- create a new note
-note_update      {"id":"<note_id>","content":"<text>"}               -- update note content
-note_delete      {"id":"<note_id>"}                                   -- delete a note
-note_graph       {}                                                   -- get the knowledge graph (nodes + edges)
-note_backlinks   {"id":"<note_id>"}                                   -- get backlinks pointing to a note
+note_list             {}                                                   -- list all notes in the knowledge base
+note_read             {"id":"<note_id>"}                                   -- read a note (returns content + metadata)
+note_search           {"query":"<search term>"}                            -- full-text fuzzy search across all notes
+note_search_semantic  {"query":"<search term>"}                            -- AI-powered semantic search (meaning-based)
+note_create           {"path":"<path>","title":"<Title>","content":"..."}  -- create a new note (path like 'Projects/My-Idea')
+note_update           {"id":"<note_id>","content":"<text>","tags":"a,b"}   -- update note content, tags, or title
+note_delete           {"id":"<note_id>"}                                   -- delete a note
+note_rename           {"id":"<note_id>","new_id":"<new_path>"}             -- rename or move a note
+note_graph            {}                                                   -- get the knowledge graph (nodes + edges + communities)
+note_backlinks        {"id":"<note_id>"}                                   -- get backlinks pointing to a note
+note_get_context      {}                                                   -- get AI-optimized overview of entire knowledge base (RECOMMENDED: use first!)
+note_get_projects     {}                                                   -- get project cockpit (progress, tasks, health)
 """ if _NOTES_AVAILABLE else ""
 
 TOOL_DESCRIPTIONS = """
@@ -302,22 +445,61 @@ type_text        {"text":"<text>"}                                    -- type te
 open_file        {"path":"<abs path>"}                                -- open file with default app
 take_screenshot  {}                                                   -- capture screen
 web_search       {"query":"<search terms>"}                           -- search the web
+browser_control  {"action":"go_to|search|click|type|scroll|screenshot|close","url":"...","query":"..."} -- automate Chrome/Edge/Firefox via Playwright
+computer_control {"action":"type|click|move|drag|hotkey|press|scroll|copy|paste|screenshot|focus_window|screen_find|screen_click"} -- mouse, keyboard, screenshot, or AI screen finder
+computer_settings {"action":"volume_up|volume_down|mute|volume_set|brightness_up|brightness_down|close_app|close_window|full_screen|minimize|maximize|snap_left|snap_right|switch_window|show_desktop|task_manager|dark_mode|toggle_wifi|restart|shutdown","value":"..."} -- adjust settings, display/window options, Wifi, power commands
+dev_agent        {"description":"<build requirements>","language":"python|js|ts","project_name":"..."} -- multi-file workspace developer agent to plan, write, run, fix, and verify projects
+file_processor   {"file_path":"<abs path>","action":"describe|ocr|resize|convert|compress|summarize|extract_text|to_word|stats|analyze|validate|format|run|transcribe|trim|list|extract"} -- process images, pdfs, text, data, code, audio, video, zip archives
 remember_note    {"title":"<title>","content":"<text>"}               -- save note to memory
 recall_notes     {"query":"<keyword>"}                                -- search saved notes
 remember         {"key":"<k>","value":"<v>"}                          -- store a preference
 recall           {"key":"<k>"}                                        -- retrieve a preference
 update_shared_session {"key":"<k>","value":"<v>"}                     -- sync state across AI instances
 self_evolve      {"prompt":"<what to improve/add>"}                   -- trigger self-evolution to improve/rewrite my own codebase
+semantic_search  {"query":"<search query>","top_k":5}                 -- search codebase by semantic meaning (embedding-based, auto-indexes)
+read_many_files  {"path":"<dir>","include":["**/*.py"],"exclude":["test_*"],"max_chars":50000} -- batch read files matching glob patterns
+shell_background {"command":"<long running command>"}                  -- start a background process (returns PID)
+shell_status     {"pid":<pid>}                                        -- check background process status and output
+shell_kill       {"pid":<pid>}                                        -- kill a background process
 """ + _NOTES_DESCRIPTION
 
 
 def execute_tool(action: str, args: dict) -> str:
     fn = TOOLS.get(action)
     if fn is None:
-        # Fallback to old computer executor
-        from actions.computer import execute_action
-        return execute_action(action, args)
+        # Try legacy computer executor as fallback
+        try:
+            from actions.computer import execute_action
+            result = execute_action(action, args)
+            if result and "unknown" not in str(result).lower():
+                return result
+        except Exception:
+            pass
+        available = registry.get_all_names()
+        return (
+            f"Error: Unknown tool '{action}'. "
+            f"Available tools: {', '.join(available)}"
+        )
+
+    # Git checkpoint before destructive file operations
+    if action in ("write_file", "edit_file", "patch_file", "delete_file", "move_file"):
+        try:
+            from core.git_checkpoint import checkpoint_before_edit
+            import os
+            path = args.get("path", args.get("src", ""))
+            cwd = os.getcwd()
+            if checkpoint_before_edit(cwd, action, path):
+                log.info(f"📌 Git checkpoint before {action}")
+        except Exception as e:
+            log.debug(f"Git checkpoint skipped: {e}")
+
     log.info(f"Executing tool: {action}({list(args.keys())})")
-    result = fn(args)
+    try:
+        result = fn(args)
+    except Exception as e:
+        log.error(f"Tool '{action}' raised exception: {e}", exc_info=True)
+        result = f"Error executing {action}: {e}"
     log.info(f"Tool result ({action}): {str(result)[:120]}")
     return result
+
+

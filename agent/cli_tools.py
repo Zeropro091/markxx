@@ -13,49 +13,66 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
+import fnmatch
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from core.logger import get_logger
 log = get_logger("cli_tools")
 
 
 def tool_edit_file(args: dict) -> str:
-    """Search-and-replace editing. Finds `old` text in a file and replaces with `new`."""
+    """Smart search-and-replace editing with 4-strategy cascade.
+
+    Tries: exact → flexible (whitespace-insensitive) → regex → fuzzy (Levenshtein).
+    Much more reliable than naive string matching.
+    """
     path = args.get("path", "")
     old  = args.get("old", "")
     new  = args.get("new", "")
+    allow_multiple = args.get("allow_multiple", False)
     if not path:
         return "Error: no path provided"
     if not old:
         return "Error: no 'old' text to search for"
 
     try:
+        from core.smart_edit import smart_edit, detect_omission_placeholders
+
         p = Path(path)
         if not p.exists():
             return f"Error: file not found: {path}"
 
         content = p.read_text(encoding="utf-8", errors="replace")
-        count = content.count(old)
-        if count == 0:
+        result = smart_edit(content, old, new, allow_multiple)
+
+        if result.occurrences == 0:
             # Show nearby lines to help the LLM adjust
             first_line = old.strip().split("\n")[0][:60]
             lines = content.split("\n")
             near = []
             for i, line in enumerate(lines):
                 if first_line.lower() in line.lower():
-                    start = max(0, i - 1)
-                    end = min(len(lines), i + 2)
                     near.append(f"  Line {i+1}: {lines[i].rstrip()}")
             context = "\n".join(near[:5]) if near else "(no similar lines found)"
-            return f"Error: 'old' text not found in {path}. Similar lines:\n{context}"
+            return f"Error: 'old' text not found in {path} (tried exact, flexible, regex, fuzzy). Similar lines:\n{context}"
 
-        new_content = content.replace(old, new)
+        if not allow_multiple and result.occurrences > 1:
+            return (
+                f"Error: found {result.occurrences} occurrences in {path} "
+                f"(strategy: {result.strategy}). Set allow_multiple=true or add more context to make the match unique."
+            )
+
+        # Check for omission placeholders
+        omissions = detect_omission_placeholders(new)
+        warning = ""
+        if omissions:
+            warning = f"\n⚠️  Possible omission placeholders detected: {omissions[:2]}"
 
         # Generate diff
         diff_lines = list(difflib.unified_diff(
             content.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
+            result.new_content.splitlines(keepends=True),
             fromfile=f"{path} (before)",
             tofile=f"{path} (after)",
         ))
@@ -63,9 +80,10 @@ def tool_edit_file(args: dict) -> str:
         if len(diff_text) > 2000:
             diff_text = diff_text[:2000] + "\n... (diff truncated)"
 
-        p.write_text(new_content, encoding="utf-8")
-        log.info(f"Edited {path}: {count} replacement(s)")
-        return f"Edited {path}: replaced {count} occurrence(s)\n{diff_text}"
+        p.write_text(result.new_content, encoding="utf-8")
+        strategy_label = f" [strategy: {result.strategy}]" if result.strategy != "exact" else ""
+        log.info(f"Edited {path}: {result.occurrences} replacement(s) via {result.strategy}")
+        return f"Edited {path}: replaced {result.occurrences} occurrence(s){strategy_label}{warning}\n{diff_text}"
 
     except Exception as e:
         return f"Error editing file: {e}"
@@ -449,3 +467,213 @@ def tool_patch_file(args: dict) -> str:
 
     except Exception as e:
         return f"Error patching file: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ReadManyFiles — batch read files with glob include/exclude
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tool_read_many_files(args: dict) -> str:
+    """Read multiple files matching glob patterns in one tool call."""
+    path = args.get("path", ".")
+    include = args.get("include", ["**/*"])
+    exclude = args.get("exclude", [])
+    max_chars = int(args.get("max_chars", 50000))
+
+    if isinstance(include, str):
+        include = [include]
+    if isinstance(exclude, str):
+        exclude = [exclude]
+
+    try:
+        root = Path(path).resolve()
+        if not root.exists():
+            return f"Error: path not found: {path}"
+        if not root.is_dir():
+            return f"Error: path is not a directory: {path}"
+
+        skip_parts = {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
+
+        # Collect matching files
+        matched = []
+        for pattern in include:
+            for fp in root.glob(pattern):
+                if not fp.is_file():
+                    continue
+                if any(part in fp.parts for part in skip_parts):
+                    continue
+                # Check exclude patterns against relative path
+                rel = str(fp.relative_to(root)).replace("\\", "/")
+                if any(fnmatch.fnmatch(rel, ex) for ex in exclude):
+                    continue
+                if fp.stat().st_size > 500_000:
+                    continue
+                matched.append(fp)
+
+        # Deduplicate and sort
+        matched = sorted(set(matched))
+
+        if not matched:
+            return f"No files matched include={include} exclude={exclude} in {path}"
+
+        # Concatenate with headers
+        parts = []
+        total_chars = 0
+        files_read = 0
+        files_skipped = 0
+        for fp in matched:
+            try:
+                content = fp.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                files_skipped += 1
+                continue
+
+            rel = str(fp.relative_to(root)).replace("\\", "/")
+            header = f"=== {rel} ==="
+            entry = f"{header}\n{content}\n"
+
+            if total_chars + len(entry) > max_chars:
+                remaining = len(matched) - files_read
+                parts.append(f"\n... truncated ({remaining} more file(s), max_chars={max_chars} reached)")
+                break
+
+            parts.append(entry)
+            total_chars += len(entry)
+            files_read += 1
+
+        summary = f"Read {files_read} file(s) ({total_chars:,} chars)"
+        if files_skipped:
+            summary += f", {files_skipped} skipped (unreadable)"
+        return summary + "\n\n" + "\n".join(parts)
+
+    except Exception as e:
+        return f"Error reading files: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Background Shell — start, check, and kill long-running processes
+# ══════════════════════════════════════════════════════════════════════════════
+
+_background_processes: Dict[int, subprocess.Popen] = {}
+
+
+def tool_shell_background(args: dict) -> str:
+    """Start a command in the background. Returns PID."""
+    command = args.get("command", "")
+    if not command:
+        return "Error: no command provided"
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        pid = proc.pid
+        _background_processes[pid] = proc
+        log.info(f"Background process started: PID={pid}, cmd={command!r}")
+        return f"Started background process PID={pid}"
+
+    except Exception as e:
+        return f"Error starting background process: {e}"
+
+
+def tool_shell_status(args: dict) -> str:
+    """Check status of a background process."""
+    pid = args.get("pid")
+    if pid is None:
+        return "Error: no pid provided"
+    pid = int(pid)
+
+    proc = _background_processes.get(pid)
+    if proc is None:
+        return f"Error: no tracked process with PID={pid}. Active PIDs: {list(_background_processes.keys())}"
+
+    poll = proc.poll()
+    if poll is None:
+        # Still running — try to read available output without blocking
+        status = "running"
+        stdout_data = ""
+        stderr_data = ""
+        try:
+            # Non-blocking peek: read what's available
+            import io
+            if hasattr(proc.stdout, "readable") and proc.stdout.readable():
+                # Try a non-blocking read via peek on the underlying buffer
+                buf = proc.stdout.buffer if hasattr(proc.stdout, "buffer") else None
+                if buf and hasattr(buf, "peek"):
+                    raw = buf.peek(4096)
+                    if raw:
+                        stdout_data = raw.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        result = f"PID={pid}: {status}"
+        if stdout_data:
+            result += f"\nstdout (partial): {stdout_data[:2000]}"
+        return result
+    else:
+        # Process finished
+        status = f"exited (code={poll})"
+        stdout_data = ""
+        stderr_data = ""
+        try:
+            stdout_data = proc.stdout.read() if proc.stdout else ""
+            stderr_data = proc.stderr.read() if proc.stderr else ""
+        except Exception:
+            pass
+
+        # Clean up
+        del _background_processes[pid]
+
+        result = f"PID={pid}: {status}"
+        if stdout_data:
+            result += f"\nstdout:\n{stdout_data[:3000]}"
+        if stderr_data:
+            result += f"\nstderr:\n{stderr_data[:1000]}"
+        return result
+
+
+def tool_shell_kill(args: dict) -> str:
+    """Kill a background process."""
+    pid = args.get("pid")
+    if pid is None:
+        return "Error: no pid provided"
+    pid = int(pid)
+
+    proc = _background_processes.get(pid)
+    if proc is None:
+        return f"Error: no tracked process with PID={pid}. Active PIDs: {list(_background_processes.keys())}"
+
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+        # Collect remaining output
+        stdout_data = ""
+        stderr_data = ""
+        try:
+            stdout_data = proc.stdout.read() if proc.stdout else ""
+            stderr_data = proc.stderr.read() if proc.stderr else ""
+        except Exception:
+            pass
+
+        del _background_processes[pid]
+
+        result = f"Killed PID={pid} (exit code={proc.returncode})"
+        if stdout_data:
+            result += f"\nstdout:\n{stdout_data[:2000]}"
+        if stderr_data:
+            result += f"\nstderr:\n{stderr_data[:1000]}"
+        return result
+
+    except Exception as e:
+        return f"Error killing PID={pid}: {e}"
+

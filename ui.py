@@ -368,6 +368,12 @@ class SettingsDialog(QDialog):
         self.wake_enabled_cb.setChecked(self.settings.wake_word_enabled)
         f.addRow("", self.wake_enabled_cb)
         f.addRow(self._hint('When enabled, MARK only responds after hearing "hey mark", "hello mark", etc.'))
+        
+        self.live_mode_cb = QCheckBox("Enable Gemini Live Audio Streaming Loop")
+        self.live_mode_cb.setChecked(getattr(self.settings, "multimodal_live_mode", False))
+        f.addRow("", self.live_mode_cb)
+        f.addRow(self._hint("Bypasses Whisper/edge-tts and uses real-time Gemini Live WebSocket streaming."))
+
         tabs.addTab(wrap(vo), "🎙️ Voice")
 
         # ══════════════════════════════════════════════════ TAB 3: Interface
@@ -437,6 +443,7 @@ class SettingsDialog(QDialog):
         s.silence_hysteresis = s.mic_sensitivity * 0.6
         s.wake_word        = self.wake_word_input.text().strip().lower()
         s.wake_word_enabled = self.wake_enabled_cb.isChecked()
+        s.multimodal_live_mode = self.live_mode_cb.isChecked()
         s.window_opacity   = self.opacity_slider.value() / 100.0
         s.font_size        = self.font_slider.value()
         _szs = [(380,580),(480,720),(600,800),(700,900)]
@@ -809,6 +816,21 @@ class MarkWindow(QMainWindow):
 
         self.llm_client.on_key_rotated = _on_key_rotated
 
+        if getattr(self.settings, "multimodal_live_mode", False):
+            from core.live_session import LiveSignals, run_live
+            self.live_signals = LiveSignals()
+            self.live_signals.add_bubble.connect(self._add_bubble)
+            self.live_signals.set_status.connect(lambda msg, err=False: self._set_status(msg, err))
+            self.live_signals.set_thinking.connect(self._on_thinking)
+
+            self.live_thread = threading.Thread(
+                target=run_live,
+                args=(self.settings, self.live_signals, self),
+                daemon=True
+            )
+            self.live_thread.start()
+            self._set_status("Multimodal Live Active")
+
     # ── Apply Settings ────────────────────────────────────────────────────────
     def _apply_settings(self):
         self.setWindowOpacity(self.settings.window_opacity)
@@ -862,6 +884,13 @@ class MarkWindow(QMainWindow):
         text = self._text_input.toPlainText().strip()
         if not text or self._is_thinking:
             return
+        if getattr(self.settings, "multimodal_live_mode", False):
+            self._text_input.clear()
+            self._add_bubble(text, "user")
+            if hasattr(self, "live_session"):
+                self.live_session.speak(text)
+            return
+
         if not self.llm_client.is_configured:
             self._add_bubble("⚠️ Please set your Gemini API key in Settings (⚙️).", "error")
             return
@@ -1017,6 +1046,15 @@ class MarkWindow(QMainWindow):
             self._set_status(f"🔇 Processing in {remaining:.1f}s…")
 
     def _toggle_mic(self):
+        if getattr(self.settings, "multimodal_live_mode", False):
+            self._is_listening = self._mic_btn.isChecked()
+            self._waveform.set_active(self._is_listening)
+            if self._is_listening:
+                self._set_status("Listening...")
+            else:
+                self._set_status("Muted")
+            return
+
         if not self.stt_worker:
             self._add_bubble("STT not available. Install faster-whisper.", "error")
             return
@@ -1234,6 +1272,8 @@ class MarkWindow(QMainWindow):
                 pass
 
         # Stop threads
+        if hasattr(self, "live_session"):
+            self.live_session.stop()
         if self.stt_worker and self.stt_worker.isRunning():
             self.stt_worker.stop()
         if self.tts_worker and self.tts_worker.isRunning():

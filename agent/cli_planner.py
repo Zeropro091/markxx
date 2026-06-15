@@ -8,6 +8,7 @@ Pillar 4: Path jailing, secret redaction, interceptor, dry-run mode
 """
 
 import json
+import sys
 import time
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from core.safety import (
     MarkIgnore, ContextPruner, TokenBudget, WorkspaceMapper,
     PathJail, SecretRedactor, Interceptor, DryRunner,
 )
+from core.hooks import hooks
 from agent.tools import (
     TOOL_DESCRIPTIONS, execute_tool,
     GEMINI_DIR, NEMESI_DIR, MEMORY_DIR, SHARED_SESSION
@@ -27,9 +29,9 @@ from agent.tools import (
 
 log = get_logger("cli_planner")
 
-MAX_STEPS      = 10
+MAX_STEPS      = 20
 MAX_RESULT_LEN = 3000
-MAX_HEAL_RETRIES = 3   # Self-healing: max automatic retries on failure
+MAX_HEAL_RETRIES = 5   # Self-healing: max automatic retries on failure
 STATE_DIR = ".mark"    # State persistence directory
 
 
@@ -63,9 +65,17 @@ if not C.supports_color():
             setattr(C, attr, "")
 
 
+# ── Knowledge Base ────────────────────────────────────────────────────────────
+try:
+    from core.knowledge import get_knowledge_base
+    _kb = get_knowledge_base()
+except Exception:
+    _kb = None
+
+
 # ── Load .gemini context ──────────────────────────────────────────────────────
 def _load_gemini_context() -> str:
-    """Load GEMINI.md persona and user profile for injection into system prompt."""
+    """Load GEMINI.md persona, user profile, shared session, and knowledge base."""
     parts = []
 
     gemini_md = GEMINI_DIR / "GEMINI.md"
@@ -95,12 +105,21 @@ def _load_gemini_context() -> str:
         except Exception:
             pass
 
+    # Load knowledge base context
+    if _kb:
+        try:
+            kb_summary = _kb.get_context_summary()
+            if kb_summary:
+                parts.append(kb_summary)
+        except Exception:
+            pass
+
     return "\n\n---\n\n".join(parts) if parts else ""
 
 
 # ── System Prompt (CLI-optimized) ─────────────────────────────────────────────
 CLI_SYSTEM_PROMPT = """You are MARK, an advanced agentic AI assistant running in CLI mode on the user's computer.
-You have direct access to their system and can execute tools to complete tasks.
+You have direct access to their system and can execute tools to complete tasks autonomously.
 
 {gemini_context}
 
@@ -114,33 +133,29 @@ Use absolute paths derived from this directory when creating or editing files.
 ## Workspace Map
 {workspace_map}
 
-## How You Work
-You operate in a ReAct loop:
-1. THINK about what needs to be done
-2. ACT by calling one tool at a time (emit JSON)
-3. OBSERVE the result
-4. Repeat until the task is complete
-5. Give a final natural language response
+## How You Work (The Agentic Loop)
+You operate in a continuous ReAct loop:
+1. **PLAN**: For complex tasks, first write out a brief plan of steps you intend to take.
+2. **THINK**: Reason about the immediate next step based on the user task and previous tool results.
+3. **ACT**: Call EXACTLY one tool at a time to move the task forward.
+4. **OBSERVE**: Analyze the result of the tool call.
+5. **ITERATE**: Repeat the loop until the goal is fully achieved.
+6. **FINISH**: Provide a final response summarizing what you've done.
 
 ## Tool Calling
-When you need to perform an action, emit EXACTLY one JSON object on its own line starting with TOOL_CALL: like this (no markdown fences):
-TOOL_CALL: {{"action": "tool_name", "args": {{"key": "value"}}}}
-Only emit ONE tool call per response. After seeing the result, decide the next step.
-When done, respond naturally without a TOOL_CALL: line.
+You have access to tools via function calling. Call tools directly when you need to perform an action.
+Only call ONE tool per response. After seeing the result, decide the next step.
+When done, respond naturally without calling a tool.
 
-## Rules
-- Be autonomous: don't ask for confirmation, just do it
-- Be efficient: chain tools to complete complex tasks
-- Be transparent: briefly explain what you're doing before each tool call
-- Use absolute paths when writing or editing files
-- For commands, prefer PowerShell on Windows
-- When editing code, prefer `edit_file` or `patch_file` over rewriting entire files with `write_file`
-- Use `search_files` and `glob_files` to explore the codebase before making changes
-- Always verify your changes: run syntax checks, tests, or the code itself after editing
-- Use `git_diff` to check what changed before starting your work
-- If a command fails with an error, read the error message, fix the code, and retry
-
-{tool_descriptions}
+## Core Rules for Autonomy
+- **Think Continuous**: Do not stop until the task is DONE. If you need 10 steps, take 10 steps.
+- **Self-Healing**: If a tool fails or a command returns an error, analyze the output, fix your approach, and retry.
+- **Proactive Exploration**: Use `search_files` and `glob_files` to understand the codebase before editing.
+- **Verification**: Always verify your changes (run tests, check syntax, or use `ls`) before claiming success.
+- **Absolute Paths**: Always use absolute paths for file operations.
+- **Chain Actions**: If a task has multiple sub-tasks, do them sequentially in the same loop.
+- **Act Immediately**: NEVER say "I will..." or "I am going to..." — call the tool right away.
+- **No Narration**: If you need data, call the tool IMMEDIATELY without describing your plan first.
 """
 
 
@@ -256,10 +271,33 @@ class CLIPlanner:
 
         # Pillar 1: State persistence
         self.state = SessionState(working_dir)
+
+        # Lifecycle hooks: load from .mark/hooks/
+        hooks.load_from_config(working_dir)
         self.working_dir = working_dir
 
         # Self-healing: track last failed command for auto-retry
         self._heal_attempts = 0
+
+        # Streaming: track whether we're mid-stream (for newline management)
+        self._streaming_active = False
+
+        # Plan mode: read-only exploration
+        self.plan_mode = False
+        self._plan_mode_tools = {
+            "read_file", "list_files", "search_files", "glob_files",
+            "web_search", "fetch_url", "semantic_search", "recall_notes",
+            "read_user_profile", "git_diff", "read_many_files",
+            "note_list", "note_read", "note_search", "note_search_semantic",
+            "note_graph", "note_backlinks", "note_get_context", "note_get_projects",
+        }
+
+        # Context compaction
+        from core.context import ContextCompactor
+        self.context = ContextCompactor(
+            max_tokens=self.settings.llm_max_tokens * 4 if hasattr(self.settings, 'llm_max_tokens') else 100_000,
+            window_size=20,
+        )
 
     def _refresh_system_prompt(self, working_dir: str = "."):
         """Rebuild system prompt with fresh context + workspace map."""
@@ -277,8 +315,13 @@ class CLIPlanner:
             memory_context=memory_ctx or "No prior context.",
             working_dir=str(Path(working_dir).resolve()),
             workspace_map=workspace_map,
-            tool_descriptions=TOOL_DESCRIPTIONS,
         )
+
+        # MARK.md hierarchical context
+        from core.markmd import load_mark_context
+        mark_ctx = load_mark_context(working_dir)
+        if mark_ctx:
+            prompt += f"\n\n## Developer Instructions (MARK.md)\n{mark_ctx}"
 
         if self.settings.cli_system_prompt:
             prompt += f"\n\n## Custom Developer Rules\n{self.settings.cli_system_prompt}"
@@ -305,14 +348,19 @@ class CLIPlanner:
                 # Pillar 3: Check token budget
                 if self.budget.is_exhausted:
                     print(f"\n  {C.RED}[BUDGET EXHAUSTED] {self.budget.usage_summary}{C.RESET}")
-                    accumulated_response = "Token budget exhausted. Stopping to prevent overspend."
+                    accumulated_response += "\n[Token budget exhausted. Stopping to prevent overspend.]"
                     break
 
                 steps += 1
                 self._print_step(steps)
 
-                # Call LLM
-                raw, tool_call = self.llm.chat(current_message)
+                # Call LLM (streaming — tokens print live)
+                sys.stdout.write(f"  {C.DIM}")
+                sys.stdout.flush()
+                self._streaming_active = True
+                raw, tool_call = self.llm.chat_stream(
+                    current_message, on_chunk=self._on_stream_chunk)
+                self._finish_stream()
 
                 # Pillar 3: Track token usage
                 self.budget.record_input(current_message)
@@ -321,118 +369,175 @@ class CLIPlanner:
                 # Handle empty/blocked responses
                 if not raw and not tool_call:
                     log.warning(f"Step {steps}: empty response (possible safety filter)")
-                    accumulated_response = "[No response -- the request may have been filtered by safety settings. Try rephrasing.]"
+                    accumulated_response += "\n[No response -- the request may have been filtered by safety settings.]"
                     break
 
                 log.info(f"Step {steps}: tool={tool_call.get('action') if tool_call else None} | {len(raw)} chars")
 
-                if not tool_call:
+                # Collect current response as the running "best answer"
+                if raw:
                     accumulated_response = raw
+
+                if not tool_call:
+                    # Final answer received
                     break
 
-                # ── Execute the tool ──────────────────────────────────────────
-                action = tool_call.get("action", "")
-                args   = tool_call.get("args", {})
+                # ── Tool execution + chaining loop ──────────────────────────
+                while tool_call and steps < self.max_steps:
+                    action = tool_call.get("action", "")
+                    args   = tool_call.get("args", {})
 
-                # Pillar 4: Path jailing for file write operations
-                if action in ("write_file", "edit_file", "patch_file", "delete_file", "move_file"):
-                    path_key = "path" if "path" in args else "src"
-                    if path_key in args:
-                        allowed, reason = self.jail.is_allowed(args[path_key], "write")
-                        if not allowed:
-                            self._print_blocked(action, reason)
-                            tool_result = f"BLOCKED: {reason}"
-                            current_message = self._feed_result(action, tool_result, current_message)
-                            continue
+                    # Pillar 4: Path jailing for file write operations
+                    if action in ("write_file", "edit_file", "patch_file", "delete_file", "move_file"):
+                        path_key = "path" if "path" in args else "src"
+                        if path_key in args:
+                            allowed, reason = self.jail.is_allowed(args[path_key], "write")
+                            if not allowed:
+                                self._print_blocked(action, reason)
+                                tool_result = f"BLOCKED: {reason}"
+                                # For safety rejections, use text fallback
+                                current_message = self._feed_result(action, tool_result, current_message)
+                                break  # Break inner loop, outer loop will chat() again
 
-                # Pillar 4: Interceptor (human-in-the-loop)
-                approved, reason = self.interceptor.should_approve(action, args)
-                if not approved:
-                    self._print_blocked(action, reason)
-                    tool_result = f"REJECTED: {reason}"
-                    current_message = self._feed_result(action, tool_result, current_message)
-                    continue
+                    # Plan mode: block non-read-only tools
+                    if self.plan_mode and action not in self._plan_mode_tools:
+                        self._print_blocked(action, "Plan mode active (read-only). Use /build to exit plan mode.")
+                        tool_result = f"BLOCKED: Plan mode is active. Only read-only tools are allowed. Available: {', '.join(sorted(self._plan_mode_tools))}."
+                        current_message = self._feed_result(action, tool_result, current_message)
+                        break
 
-                # Pillar 4: Dry-run mode
-                if self.dry_runner.active:
-                    self.dry_runner.record(action, args)
-                    self._print_dry_run(action, args)
-                    tool_result = f"[DRY RUN] Would execute: {action}({list(args.keys())})"
-                    current_message = self._feed_result(action, tool_result, current_message)
-                    continue
+                    # Pillar 4: Interceptor (human-in-the-loop)
+                    approved, reason = self.interceptor.should_approve(action, args)
+                    if not approved:
+                        self._print_blocked(action, reason)
+                        tool_result = f"REJECTED: {reason}"
+                        current_message = self._feed_result(action, tool_result, current_message)
+                        break
 
-                # Memory shortcuts handled locally
-                if action == "remember":
-                    key, val = args.get("key", ""), args.get("value", "")
-                    self.memory.set_pref(key, val)
-                    tool_result = f"Stored: {key} = {val}"
-                    self._print_tool("\U0001f9e0", "remember", tool_result)
+                    # Pillar 4: Dry-run mode
+                    if self.dry_runner.active:
+                        self.dry_runner.record(action, args)
+                        self._print_dry_run(action, args)
+                        tool_result = f"[DRY RUN] Would execute: {action}({list(args.keys())})"
+                        current_message = self._feed_result(action, tool_result, current_message)
+                        break
 
-                elif action == "recall":
-                    key = args.get("key", "")
-                    val = self.memory.get_pref(key, "(not found)")
-                    tool_result = f"{key}: {val}"
-                    self._print_tool("\U0001f50e", "recall", tool_result)
+                    # Memory shortcuts handled locally
+                    if action == "remember":
+                        key, val = args.get("key", ""), args.get("value", "")
+                        self.memory.set_pref(key, val)
+                        tool_result = f"Stored: {key} = {val}"
+                        self._print_tool("\U0001f9e0", "remember", tool_result)
 
-                elif action == "self_evolve":
-                    if not self.settings.cli_enable_self_evolution:
-                        tool_result = "Error: Self-evolution is disabled in settings. Warn the user or ask them to enable it under Settings (Ctrl+S)."
-                        self._print_blocked("self_evolve", "Disabled in settings")
+                    elif action == "recall":
+                        key = args.get("key", "")
+                        val = self.memory.get_pref(key, "(not found)")
+                        tool_result = f"{key}: {val}"
+                        self._print_tool("\U0001f50e", "recall", tool_result)
+
+                    elif action == "self_evolve":
+                        if not self.settings.cli_enable_self_evolution:
+                            tool_result = "Error: Self-evolution is disabled in settings. Warn the user or ask them to enable it under Settings (Ctrl+S)."
+                            self._print_blocked("self_evolve", "Disabled in settings")
+                        else:
+                            prompt = args.get("prompt", "")
+                            if not prompt:
+                                tool_result = "Error: Please provide a 'prompt' argument for self-evolution."
+                            else:
+                                print(f"\n  🧬 [SELF-EVOLUTION] Agent triggered self-evolution: {prompt}")
+                                from agent.evolution import SelfEvolver
+                                evolver = SelfEvolver(self, self.working_dir)
+                                tool_result = evolver.run_evolution(prompt)
+                                self._print_tool("🧬", "self_evolve", "Evolution attempt finished.")
+
                     else:
-                        prompt = args.get("prompt", "")
-                        if not prompt:
-                            tool_result = "Error: Please provide a 'prompt' argument for self-evolution."
-                        else:
-                            print(f"\n  🧬 [SELF-EVOLUTION] Agent triggered self-evolution: {prompt}")
-                            from agent.evolution import SelfEvolver
-                            evolver = SelfEvolver(self, self.working_dir)
-                            tool_result = evolver.run_evolution(prompt)
-                            self._print_tool("🧬", "self_evolve", "Evolution attempt finished.")
+                        # Lifecycle hooks: before_tool
+                        hook_result = hooks.fire('before_tool', {'action': action, 'args': args})
+                        if not hook_result.allowed:
+                            self._print_blocked(action, f'Hook blocked: {hook_result.reason}')
+                            tool_result = f'BLOCKED by hook: {hook_result.reason}'
+                            current_message = self._feed_result(action, tool_result, current_message)
+                            break
+                        if hook_result.modified_args:
+                            args = hook_result.modified_args
 
-                else:
-                    # Pillar 4: Redact secrets from tool args before display
-                    display_args = {k: self.redactor.redact(str(v)) if isinstance(v, str) else v
-                                   for k, v in args.items()}
+                        # Pillar 4: Redact secrets from tool args before display
+                        display_args = {k: self.redactor.redact(str(v)) if isinstance(v, str) else v
+                                       for k, v in args.items()}
 
-                    tool_result = execute_tool(action, args)
-                    icon = self.ICON_MAP.get(action, "\u2699\ufe0f")
-                    summary = str(tool_result)
-                    if len(summary) > 200:
-                        summary = summary[:200] + "..."
-                    self._print_tool(icon, action, summary)
+                        # Diff preview for file-editing operations
+                        if action in ("edit_file", "patch_file") and self.interceptor.mode != "auto":
+                            self._show_edit_preview(action, args)
 
-                    # Show diff for edit/patch operations
-                    if action in ("edit_file", "patch_file") and "---" in str(tool_result):
-                        self._print_diff_summary(tool_result)
+                        tool_result = execute_tool(action, args)
+                        icon = self.ICON_MAP.get(action, "\u2699\ufe0f")
+                        summary = str(tool_result)
+                        if len(summary) > 200:
+                            summary = summary[:200] + "..."
+                        self._print_tool(icon, action, summary)
 
-                    # ── Pillar 1: Self-healing loop ──────────────────────────
-                    # If a run_command fails, feed the error back and let the LLM
-                    # try to fix it automatically
-                    if action == "run_command" and self._is_failure(tool_result):
-                        self._heal_attempts += 1
-                        if self._heal_attempts <= self.max_heal_retries:
-                            print(f"  {C.YELLOW}[SELF-HEAL] Command failed (attempt {self._heal_attempts}/{self.max_heal_retries}){C.RESET}")
-                            # Don't truncate — give the LLM the full error
-                            tool_result = (
-                                f"COMMAND FAILED (attempt {self._heal_attempts}):\n{tool_result}\n\n"
-                                f"Please analyze the error and fix the issue. "
-                                f"You can edit the file and re-run the command."
-                            )
-                        else:
-                            print(f"  {C.RED}[SELF-HEAL] Max retries ({self.max_heal_retries}) reached{C.RESET}")
+                        # Lifecycle hooks: after_tool
+                        hooks.fire('after_tool', {'action': action, 'args': args, 'result': str(tool_result)[:500]})
+
+                        # Show diff for edit/patch operations
+                        if action in ("edit_file", "patch_file") and "---" in str(tool_result):
+                            self._print_diff_summary(tool_result)
+
+                        # ── Pillar 1: Self-healing loop ──────────────────────
+                        if action == "run_command" and self._is_failure(tool_result):
+                            self._heal_attempts += 1
+                            if self._heal_attempts <= self.max_heal_retries:
+                                print(f"  {C.YELLOW}[SELF-HEAL] Command failed (attempt {self._heal_attempts}/{self.max_heal_retries}){C.RESET}")
+                                tool_result = (
+                                    f"COMMAND FAILED (attempt {self._heal_attempts}):\n{tool_result}\n\n"
+                                    f"Please analyze the error and fix the issue. "
+                                    f"You can edit the file and re-run the command."
+                                )
+                            else:
+                                print(f"  {C.RED}[SELF-HEAL] Max retries ({self.max_heal_retries}) reached{C.RESET}")
+                                self._heal_attempts = 0
+                        elif action != "run_command":
                             self._heal_attempts = 0
-                    elif action != "run_command":
-                        self._heal_attempts = 0  # Reset on non-command steps
 
-                # Truncate very long results (context management)
-                if len(str(tool_result)) > self.max_result_len:
-                    tool_result = str(tool_result)[:self.max_result_len] + "\n... [truncated]"
+                    # Truncate very long results
+                    if len(str(tool_result)) > self.max_result_len:
+                        tool_result = str(tool_result)[:self.max_result_len] + "\n... [truncated]"
 
-                # Feed result back as next message
-                current_message = (
-                    f"Tool `{action}` returned:\n```\n{tool_result}\n```\n"
-                    f"Continue with the task. If done, give the final response without a tool call."
-                )
+                    # Feed result back via proper FunctionResponse (streaming)
+                    sys.stdout.write(f"  {C.DIM}")
+                    sys.stdout.flush()
+                    self._streaming_active = True
+                    raw, tool_call = self.llm.chat_tool_result_stream(
+                        action, str(tool_result),
+                        on_chunk=self._on_stream_chunk)
+                    self._finish_stream()
+
+                    # Track tokens
+                    self.budget.record_input(str(tool_result))
+                    self.budget.record_output(raw or "")
+
+                    if not raw and not tool_call:
+                        log.warning(f"Step {steps}: empty response after tool result")
+                        accumulated_response += "\n[No response -- the request may have been filtered.]"
+                        break
+
+                    log.info(f"Step {steps}: tool={tool_call.get('action') if tool_call else None} | {len(raw)} chars")
+
+                    if raw:
+                        accumulated_response = raw
+
+                    if not tool_call:
+                        # Final answer from LLM — break inner loop
+                        break
+
+                    # Another tool_call — inner loop continues
+                    steps += 1
+                    self._print_step(steps)
+                    log.debug(f"Chaining tool call: {tool_call.get('action')}")
+
+                # If we got a final answer from the inner loop, break outer too
+                if accumulated_response or (not tool_call and not raw):
+                    break
 
             else:
                 # Hit step limit
@@ -520,11 +625,71 @@ class CLIPlanner:
             f"Continue with the task. If done, give the final response without a tool call."
         )
 
+    # ── Streaming helpers ──────────────────────────────────────────────────────
+
+    def _on_stream_chunk(self, text: str):
+        """Callback for streaming: write each text delta to stdout immediately."""
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def _finish_stream(self):
+        """End a streaming output block: reset color and add newline."""
+        if self._streaming_active:
+            sys.stdout.write(f"{C.RESET}\n")
+            sys.stdout.flush()
+            self._streaming_active = False
+
     # ── Terminal output helpers ────────────────────────────────────────────────
 
     def _print_step(self, step: int):
         msg = f"Thinking... (step {step})" if step > 1 else "Thinking..."
         print(f"{C.DIM}{C.CYAN}  {msg}{C.RESET}")
+
+    def _show_edit_preview(self, action: str, args: dict):
+        """Show a colored diff preview before applying file edits."""
+        try:
+            path = args.get("path", "")
+            if not path or not Path(path).exists():
+                return
+
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            old = args.get("old", "")
+            new = args.get("new", "")
+            if not old:
+                return
+
+            # Generate preview diff
+            from core.smart_edit import smart_edit
+            result = smart_edit(content, old, new)
+            if result.occurrences == 0:
+                return
+
+            import difflib
+            diff_lines = list(difflib.unified_diff(
+                content.splitlines(keepends=True)[:50],
+                result.new_content.splitlines(keepends=True)[:50],
+                fromfile=Path(path).name,
+                tofile=f"{Path(path).name} (modified)",
+                lineterm="",
+            ))
+
+            if diff_lines:
+                strategy = f" [{result.strategy}]" if result.strategy != "exact" else ""
+                print(f"\n  {C.BOLD}📋 Edit Preview{strategy}:{C.RESET}")
+                for line in diff_lines[:20]:
+                    if line.startswith("+") and not line.startswith("+++"):
+                        print(f"    {C.GREEN}{line}{C.RESET}")
+                    elif line.startswith("-") and not line.startswith("---"):
+                        print(f"    {C.RED}{line}{C.RESET}")
+                    elif line.startswith("@@"):
+                        print(f"    {C.CYAN}{line}{C.RESET}")
+                    else:
+                        print(f"    {C.DIM}{line}{C.RESET}")
+                if len(diff_lines) > 20:
+                    print(f"    {C.DIM}... ({len(diff_lines) - 20} more lines){C.RESET}")
+                print()
+        except Exception:
+            pass  # Preview is best-effort, never block the edit
 
     def _print_tool(self, icon: str, name: str, summary: str):
         if "\n" in summary:

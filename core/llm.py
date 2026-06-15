@@ -60,45 +60,35 @@ SAFETY_BLOCKED_MSG = (
 )
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are MARK, an advanced personal AI assistant — calm, precise, and highly capable. You are like J.A.R.V.I.S. from Iron Man. You run entirely on the user's machine.
+# ── Tool declarations (lazy import to avoid circular dependency) ──────────────
+_tool_declarations_cache = None
 
-{memory_context}
+def _get_tool_declarations():
+    """Lazy-load native Gemini function declarations."""
+    global _tool_declarations_cache
+    if _tool_declarations_cache is not None:
+        return _tool_declarations_cache
+    try:
+        from agent.tool_declarations import build_tool_declarations
+        _tool_declarations_cache = build_tool_declarations()
+        log.info(f"Loaded {sum(len(t.function_declarations) for t in _tool_declarations_cache)} native tool declarations")
+    except Exception as e:
+        log.warning(f"Could not load tool declarations: {e}")
+        _tool_declarations_cache = []
+    return _tool_declarations_cache
 
-## Capabilities
-You can:
-- Have natural conversations and answer questions
-- Control the computer: open apps, manage files, run commands
-- Take screenshots and analyze what's on screen
-- Analyze uploaded files (PDFs, images, documents)
-- Remember user preferences and projects persistently
-- Execute multi-step tasks autonomously
 
-## Tool Calling
-When you need to perform a computer action, emit EXACTLY one JSON block on its own line like this (no markdown fences):
-TOOL_CALL: {{"action": "open_app", "args": {{"app": "notepad"}}}}
 
-Available actions:
-- open_app: {{"app": "string"}} — open an application by name
-- run_command: {{"cmd": "string", "shell": true/false}} — run a terminal command
-- type_text: {{"text": "string"}} — type text at cursor
-- take_screenshot: {{}} — capture the current screen
-- capture_webcam: {{}} — capture from webcam
-- open_file: {{"path": "string"}} — open a file
-- create_file: {{"path": "string", "content": "string"}} — create/write a file
-- delete_file: {{"path": "string"}} — delete a file
-- list_files: {{"path": "string"}} — list directory contents
-- move_file: {{"src": "string", "dst": "string"}} — move/rename a file
-- web_search: {{"query": "string"}} — search the web
-- remember: {{"key": "string", "value": "string"}} — store a preference
-- recall: {{"key": "string"}} — recall a stored preference
-
-## Rules
-- Be concise but complete
-- When performing actions, briefly confirm what you're doing
-- If a task needs multiple steps, list them then execute
-- Never make up file paths — ask if unsure
-- Use the user's name when you know it
-"""
+def normalize_key_pool(api_key: str, extra_keys: List[str] = None) -> List[str]:
+    """Build deduplicated pool: primary first, then extras (stable order)."""
+    seen: set = set()
+    pool: List[str] = []
+    for k in ([api_key] + (extra_keys or [])):
+        k = (k or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            pool.append(k)
+    return pool
 
 
 # ── Key Rotator ────────────────────────────────────────────────────────────────
@@ -158,10 +148,10 @@ class LLMClient:
         self.temperature  = temperature
         self.max_tokens   = max_tokens
         self._chat = None
+        self._history_cache = []  # Preserve history when session is reset
 
-        # Build key pool
-        all_keys = [api_key] + (extra_keys or [])
-        self.rotator = KeyRotator(all_keys)
+        # Build key pool (dedupe — duplicates waste rotation slots)
+        self.rotator = KeyRotator(normalize_key_pool(api_key, extra_keys))
         self._client = None
         if self.rotator.current:
             self._init_client(self.rotator.current)
@@ -175,22 +165,35 @@ class LLMClient:
             self._client = genai.Client(api_key=api_key)
         else:
             genai_legacy.configure(api_key=api_key)
-        self._chat = None   # reset chat session
+        
+        # Save current history before resetting chat session
+        if self._chat:
+            try:
+                self._history_cache = list(self._chat.history)
+            except Exception:
+                pass
+        self._chat = None
 
     def configure(self, api_key: str, model: str = None, extra_keys: List[str] = None):
         if model:
             self.model_name = model
-        all_keys = [api_key] + (extra_keys or [])
-        self.rotator.load(all_keys)
+        self.rotator.load(normalize_key_pool(api_key, extra_keys))
         if self.rotator.current:
             self._init_client(self.rotator.current)
 
     def reset_chat(self):
         self._chat = None
+        self._history_cache = []
 
     def update_system_prompt(self, prompt: str):
-        self.system_prompt = prompt
-        self._chat = None
+        if prompt != self.system_prompt:
+            self.system_prompt = prompt
+            if self._chat:
+                try:
+                    self._history_cache = list(self._chat.history)
+                except Exception:
+                    pass
+            self._chat = None
 
     # ── Internal: retry + rotate on 429 ───────────────────────────────────────
     def _call_with_rotation(self, fn, *args, **kwargs):
@@ -209,7 +212,17 @@ class LLMClient:
 
             except Exception as e:
                 msg = str(e)
-                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
+                # Robust matching for 429 / rate limits across different SDK versions
+                is_rate_limit = (
+                    "429" in msg 
+                    or "RESOURCE_EXHAUSTED" in msg.upper() 
+                    or "RESOURCE_EXHAUSTED" in getattr(e, "message", "").upper()
+                    or "RATE_LIMIT" in msg.upper()
+                    or "RATE_LIMIT" in getattr(e, "message", "").upper()
+                    or "QUOTA" in msg.upper()
+                    or getattr(e, "code", 0) == 429
+                    or getattr(e, "status_code", 0) == 429
+                )
 
                 if not is_rate_limit:
                     log.error(f"LLM error (attempt {attempt+1}): {msg[:200]}")
@@ -221,26 +234,49 @@ class LLMClient:
                 m = re.search(r"retry[^0-9]*(\d+)", msg, re.I)
                 suggested_wait = int(m.group(1)) + 1 if m else backoff
 
+                # Save history before rotating
+                if self._chat:
+                    try:
+                        self._history_cache = list(self._chat.history)
+                    except Exception:
+                        pass
+
                 # Try rotating to next key first (instant, no wait)
                 rotated = self.rotator.rotate()
                 if rotated:
                     log.info(f"Key rotated → slot {self.rotator.slot}/{self.rotator.count}")
                     self._init_client(self.rotator.current)
+                    # _init_client already sets self._chat = None
                     if self.on_key_rotated:
                         self.on_key_rotated(
                             self.rotator.current,
                             self.rotator.slot,
                             self.rotator.count,
-                            "quota exhausted"
+                            "quota exhausted",
                         )
                     continue
+
+                if self.rotator.count <= 1 and self.on_key_rotated:
+                    self.on_key_rotated(
+                        self.rotator.current,
+                        self.rotator.slot,
+                        self.rotator.count,
+                        "single key — add more keys for rotation",
+                    )
 
                 # All keys tried — wait then loop back to key 0
                 log.warning(f"All keys rate-limited. Waiting {suggested_wait}s…")
                 time.sleep(suggested_wait)
                 self.rotator.reset()
                 self._init_client(self.rotator.current)
-                self._chat = None
+                # _init_client already sets self._chat = None
+                if self.on_key_rotated:
+                    self.on_key_rotated(
+                        self.rotator.current,
+                        self.rotator.slot,
+                        self.rotator.count,
+                        "cooldown retry",
+                    )
                 backoff = min(backoff * 2, 60)
 
         raise RuntimeError("All API keys exhausted. Please add more keys or wait.")
@@ -339,19 +375,94 @@ class LLMClient:
 
         log.warning("LLM returned empty/None response with no detected safety block.")
         return ""
+
+    def _extract_response_parts(self, resp) -> Tuple[str, Optional[Dict]]:
+        """Extract text AND native function_call from response parts.
+
+        Returns (text, tool_call_dict_or_None).
+        Handles both:
+          1. Native Gemini function_call parts (SDK-level tool calling)
+          2. Text-based TOOL_CALL: {...} format (prompt-level tool calling)
+
+        This replaces the pattern of calling resp.text (which silently drops
+        function_call parts with a warning) followed by _parse_tool_call().
+        """
+        text_parts: List[str] = []
+        function_call: Optional[Dict] = None
+
+        try:
+            candidates = getattr(resp, 'candidates', None)
+
+            # No candidates → safety block or empty response
+            if not candidates or len(candidates) == 0:
+                return self._extract_text_safe(resp), None
+
+            # Check finish reason for safety blocks before inspecting parts
+            finish_reason = getattr(candidates[0], 'finish_reason', None)
+            fr_str = str(finish_reason).upper() if finish_reason else ""
+            if any(kw in fr_str for kw in ("SAFETY", "RECITATION")):
+                log.warning(f"Response blocked by safety filter: {finish_reason}")
+                return SAFETY_BLOCKED_MSG, None
+
+            content = getattr(candidates[0], 'content', None)
+            if content is None:
+                return self._extract_text_safe(resp), None
+
+            parts = getattr(content, 'parts', None)
+            if not parts:
+                return self._extract_text_safe(resp), None
+
+            for part in parts:
+                # Check for native function_call
+                fc = getattr(part, 'function_call', None)
+                if fc and getattr(fc, 'name', None):
+                    fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
+                    function_call = {"action": fc.name, "args": fc_args}
+                    log.info(f"Native function_call detected: {fc.name}({list(fc_args.keys())})")
+                # Check for text
+                elif hasattr(part, 'text') and part.text:
+                    text_parts.append(part.text)
+
+        except Exception as e:
+            log.warning(f"Failed to extract response parts: {e}, falling back")
+            return self._extract_text_safe(resp), None
+
+        text = "\n".join(text_parts).strip()
+
+        # If no native function_call found, try text-based TOOL_CALL: parsing
+        if not function_call and text:
+            function_call = self._parse_tool_call(text)
+            if function_call:
+                text = self._strip_tool_call(text)
+
+        return text, function_call
     
+    def _generate_config(self, **extra) -> "genai_types.GenerateContentConfig":
+        """Build SDK config with native tool declarations."""
+        kwargs = {
+            "temperature": self.temperature,
+            "safety_settings": SAFETY_SETTINGS,
+            **extra,
+        }
+        if self.max_tokens is not None:
+            kwargs["max_output_tokens"] = self.max_tokens
+        # Inject native tool declarations if available
+        if "tools" not in kwargs:
+            decls = _get_tool_declarations()
+            if decls:
+                kwargs["tools"] = decls
+        return genai_types.GenerateContentConfig(**kwargs)
+
     # ── Chat session ──────────────────────────────────────────────────────────
     def _get_chat(self):
         if self._chat is None and self._client:
             if NEW_SDK:
                 self._chat = self._client.chats.create(
                     model=self.model_name,
-                    config=genai_types.GenerateContentConfig(
+                    config=self._generate_config(
                         system_instruction=self.system_prompt,
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_tokens,
-                        safety_settings=SAFETY_SETTINGS,
-                    )
+                    ),
+                    history=self._history_cache
                 )
         return self._chat
 
@@ -369,7 +480,7 @@ class LLMClient:
                 if ch is None:
                     raise RuntimeError("Client not initialised.")
                 resp = ch.send_message(message)
-                return self._extract_text_safe(resp)
+                return resp  # Return raw response for part-level inspection
             else:
                 model = genai_legacy.GenerativeModel(
                     self.model_name, system_instruction=self.system_prompt,
@@ -377,28 +488,283 @@ class LLMClient:
                 if self._chat is None:
                     self._chat = model.start_chat()
                 resp = self._chat.send_message(message)
-                return self._extract_text_safe(resp)
+                return self._extract_text_safe(resp)  # Legacy: text-only
 
         try:
-            text = self._call_with_rotation(_do)
+            result = self._call_with_rotation(_do)
             elapsed = time.time() - t0
-            tool_call = self._parse_tool_call(text)
+
+            if isinstance(result, str):
+                # Legacy SDK path — result is already extracted text
+                text = result
+                tool_call = self._parse_tool_call(text)
+                if tool_call:
+                    text = self._strip_tool_call(text)
+            else:
+                # New SDK path — result is the raw response object
+                text, tool_call = self._extract_response_parts(result)
+
             log.info(f"LLM response in {elapsed:.2f}s | tool={tool_call.get('action') if tool_call else None} | {len(text)} chars")
-            if tool_call:
-                text = self._strip_tool_call(text)
             return text, tool_call
         except Exception as e:
             log.error(f"chat failed: {e}")
             return f"Error: {e}", None
 
+    def chat_tool_result(self, tool_name: str, result: str) -> Tuple[str, Optional[Dict]]:
+        """Send a FunctionResponse back to the chat after executing a tool.
+
+        This maintains proper function_call → function_response pairing in the
+        chat history, so the LLM sees structured tool results instead of plain text.
+        Falls back to a regular chat message if native calling isn't available.
+        """
+        if not self.rotator.count:
+            return "Please add a Gemini API key in Settings.", None
+
+        t0 = time.time()
+
+        def _do():
+            if NEW_SDK:
+                ch = self._get_chat()
+                if ch is None:
+                    raise RuntimeError("Client not initialised.")
+                # Send as a proper FunctionResponse part
+                try:
+                    func_response = genai_types.Part.from_function_response(
+                        name=tool_name,
+                        response={"result": result[:3000]},
+                    )
+                    resp = ch.send_message(func_response)
+                    return resp
+                except (AttributeError, TypeError) as e:
+                    # SDK version may not support Part.from_function_response
+                    log.warning(f"FunctionResponse not supported: {e}, falling back to text")
+                    fallback_msg = (
+                        f"Tool `{tool_name}` returned:\n```\n{result}\n```\n"
+                        f"Continue with the task. If done, give the final response."
+                    )
+                    resp = ch.send_message(fallback_msg)
+                    return resp
+            else:
+                # Legacy SDK — send as text
+                fallback_msg = (
+                    f"Tool `{tool_name}` returned:\n```\n{result}\n```\n"
+                    f"Continue with the task. If done, give the final response."
+                )
+                if self._chat is None:
+                    raise RuntimeError("No active chat session.")
+                resp = self._chat.send_message(fallback_msg)
+                return self._extract_text_safe(resp)
+
+        try:
+            resp = self._call_with_rotation(_do)
+            elapsed = time.time() - t0
+
+            if isinstance(resp, str):
+                text = resp
+                tool_call = self._parse_tool_call(text)
+                if tool_call:
+                    text = self._strip_tool_call(text)
+            else:
+                text, tool_call = self._extract_response_parts(resp)
+
+            log.info(f"Tool result response in {elapsed:.2f}s | tool={tool_call.get('action') if tool_call else None} | {len(text)} chars")
+            return text, tool_call
+        except Exception as e:
+            log.error(f"chat_tool_result failed: {e}")
+            return f"Error: {e}", None
+
+    # ── Streaming variants ─────────────────────────────────────────────────────
+
+    def chat_stream(self, message: str, on_chunk=None) -> Tuple[str, Optional[Dict]]:
+        """Send text message with streaming. Calls on_chunk(text_delta) per chunk.
+
+        Returns (full_text, tool_call_or_None) — same contract as chat().
+        Falls back to non-streaming chat() on any streaming error.
+        """
+        if not self.rotator.count:
+            return "Please add a Gemini API key in Settings.", None
+
+        if not NEW_SDK:
+            # Legacy SDK has no streaming chat support — fall back
+            return self.chat(message)
+
+        log.debug(f"chat_stream → {message[:100]}")
+        t0 = time.time()
+
+        def _do():
+            ch = self._get_chat()
+            if ch is None:
+                raise RuntimeError("Client not initialised.")
+            return ch.send_message_stream(message)
+
+        try:
+            stream = self._call_with_rotation(_do)
+            text_parts: List[str] = []
+            last_chunk = None
+
+            for chunk in stream:
+                last_chunk = chunk
+                # Extract incremental text from this chunk
+                delta = ""
+                try:
+                    delta = chunk.text or ""
+                except (ValueError, AttributeError):
+                    # chunk.text may raise ValueError if blocked; try parts
+                    try:
+                        for part in chunk.candidates[0].content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                delta += part.text
+                    except Exception:
+                        pass
+
+                if delta:
+                    text_parts.append(delta)
+                    if on_chunk:
+                        on_chunk(delta)
+
+            # Reconstruct final text
+            full_text = "".join(text_parts).strip()
+
+            # Extract function_call from the accumulated response.
+            # After streaming completes, the chat history is updated by the SDK.
+            # We inspect the last chunk for function_call parts.
+            function_call = None
+            try:
+                if last_chunk and hasattr(last_chunk, 'candidates') and last_chunk.candidates:
+                    content = getattr(last_chunk.candidates[0], 'content', None)
+                    if content and hasattr(content, 'parts') and content.parts:
+                        for part in content.parts:
+                            fc = getattr(part, 'function_call', None)
+                            if fc and getattr(fc, 'name', None):
+                                fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
+                                function_call = {"action": fc.name, "args": fc_args}
+                                log.info(f"Stream: native function_call detected: {fc.name}")
+                                break
+            except Exception as e:
+                log.debug(f"Stream function_call extraction failed: {e}")
+
+            # Fallback: check text-based TOOL_CALL: pattern
+            if not function_call and full_text:
+                function_call = self._parse_tool_call(full_text)
+                if function_call:
+                    full_text = self._strip_tool_call(full_text)
+
+            elapsed = time.time() - t0
+            log.info(f"LLM stream response in {elapsed:.2f}s | tool={function_call.get('action') if function_call else None} | {len(full_text)} chars")
+            return full_text, function_call
+
+        except Exception as e:
+            log.warning(f"chat_stream failed ({e}), falling back to chat()")
+            return self.chat(message)
+
+    def chat_tool_result_stream(self, tool_name: str, result: str,
+                                on_chunk=None) -> Tuple[str, Optional[Dict]]:
+        """Send a FunctionResponse with streaming. Same contract as chat_tool_result().
+
+        Falls back to non-streaming chat_tool_result() on error.
+        """
+        if not self.rotator.count:
+            return "Please add a Gemini API key in Settings.", None
+
+        if not NEW_SDK:
+            return self.chat_tool_result(tool_name, result)
+
+        t0 = time.time()
+
+        def _do():
+            ch = self._get_chat()
+            if ch is None:
+                raise RuntimeError("Client not initialised.")
+            try:
+                func_response = genai_types.Part.from_function_response(
+                    name=tool_name,
+                    response={"result": result[:3000]},
+                )
+                return ch.send_message_stream(func_response)
+            except (AttributeError, TypeError) as e:
+                log.warning(f"FunctionResponse not supported for stream: {e}, text fallback")
+                fallback_msg = (
+                    f"Tool `{tool_name}` returned:\n```\n{result}\n```\n"
+                    f"Continue with the task. If done, give the final response."
+                )
+                return ch.send_message_stream(fallback_msg)
+
+        try:
+            stream = self._call_with_rotation(_do)
+            text_parts: List[str] = []
+            last_chunk = None
+
+            for chunk in stream:
+                last_chunk = chunk
+                delta = ""
+                try:
+                    delta = chunk.text or ""
+                except (ValueError, AttributeError):
+                    try:
+                        for part in chunk.candidates[0].content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                delta += part.text
+                    except Exception:
+                        pass
+
+                if delta:
+                    text_parts.append(delta)
+                    if on_chunk:
+                        on_chunk(delta)
+
+            full_text = "".join(text_parts).strip()
+
+            # Extract function_call from last chunk
+            function_call = None
+            try:
+                if last_chunk and hasattr(last_chunk, 'candidates') and last_chunk.candidates:
+                    content = getattr(last_chunk.candidates[0], 'content', None)
+                    if content and hasattr(content, 'parts') and content.parts:
+                        for part in content.parts:
+                            fc = getattr(part, 'function_call', None)
+                            if fc and getattr(fc, 'name', None):
+                                fc_args = dict(fc.args) if getattr(fc, 'args', None) else {}
+                                function_call = {"action": fc.name, "args": fc_args}
+                                log.info(f"Stream tool result: native function_call: {fc.name}")
+                                break
+            except Exception as e:
+                log.debug(f"Stream tool result function_call extraction failed: {e}")
+
+            if not function_call and full_text:
+                function_call = self._parse_tool_call(full_text)
+                if function_call:
+                    full_text = self._strip_tool_call(full_text)
+
+            elapsed = time.time() - t0
+            log.info(f"Tool result stream in {elapsed:.2f}s | tool={function_call.get('action') if function_call else None} | {len(full_text)} chars")
+            return full_text, function_call
+
+        except Exception as e:
+            log.warning(f"chat_tool_result_stream failed ({e}), falling back")
+            return self.chat_tool_result(tool_name, result)
+
     def chat_with_image(self, message: str, image_bytes: bytes,
                         mime_type: str = "image/png") -> Tuple[str, Optional[Dict]]:
-        """Send message + image."""
+        """Send message + image via chat session for context-aware analysis."""
         if not self.rotator.count:
             return "Please add a Gemini API key in Settings.", None
 
         def _do():
             if NEW_SDK and self._client:
+                # Use chat session for context awareness (P4 fix)
+                ch = self._get_chat()
+                if ch:
+                    try:
+                        parts = [
+                            genai_types.Part.from_text(text=message),
+                            genai_types.Part.from_bytes(
+                                data=image_bytes, mime_type=mime_type),
+                        ]
+                        resp = ch.send_message(parts)
+                        return resp
+                    except Exception as e:
+                        log.warning(f"Chat session image failed: {e}, falling back to stateless")
+                # Fallback: stateless generate_content
                 resp = self._client.models.generate_content(
                     model=self.model_name,
                     contents=[
@@ -407,13 +773,9 @@ class LLMClient:
                         genai_types.Part.from_bytes(
                             data=image_bytes, mime_type=mime_type),
                     ],
-                    config=genai_types.GenerateContentConfig(
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_tokens,
-                        safety_settings=SAFETY_SETTINGS,
-                    )
+                    config=self._generate_config(),
                 )
-                return self._extract_text_safe(resp)
+                return resp
             else:
                 model = genai_legacy.GenerativeModel(
                     self.model_name, system_instruction=self.system_prompt,
@@ -421,13 +783,17 @@ class LLMClient:
                 resp = model.generate_content(
                     [message, {"mime_type": mime_type, "data": image_bytes}]
                 )
-                return self._extract_text_safe(resp)
+                return self._extract_text_safe(resp)  # Legacy: text-only
 
         try:
-            text = self._call_with_rotation(_do)
-            tool_call = self._parse_tool_call(text)
-            if tool_call:
-                text = self._strip_tool_call(text)
+            result = self._call_with_rotation(_do)
+            if isinstance(result, str):
+                text = result
+                tool_call = self._parse_tool_call(text)
+                if tool_call:
+                    text = self._strip_tool_call(text)
+            else:
+                text, tool_call = self._extract_response_parts(result)
             return text, tool_call
         except Exception as e:
             return f"Error: {e}", None
