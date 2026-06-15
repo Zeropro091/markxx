@@ -24,24 +24,28 @@ except ImportError:
 def _build_safety_settings():
     """Build permissive safety settings to avoid silent content blocking."""
     if NEW_SDK:
-        return [
-            genai_types.SafetySetting(
-                category="HARM_CATEGORY_HARASSMENT",
-                threshold="OFF",
-            ),
-            genai_types.SafetySetting(
-                category="HARM_CATEGORY_HATE_SPEECH",
-                threshold="OFF",
-            ),
-            genai_types.SafetySetting(
-                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                threshold="OFF",
-            ),
-            genai_types.SafetySetting(
-                category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                threshold="OFF",
-            ),
+        categories = [
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "HARM_CATEGORY_CIVIC_INTEGRITY",
         ]
+        settings = []
+        for cat in categories:
+            try:
+                settings.append(genai_types.SafetySetting(
+                    category=cat, threshold="OFF",
+                ))
+            except Exception:
+                # Some models/API versions don't support all categories
+                try:
+                    settings.append(genai_types.SafetySetting(
+                        category=cat, threshold="BLOCK_NONE",
+                    ))
+                except Exception:
+                    pass
+        return settings
     else:
         # Legacy SDK uses dict-based safety settings
         from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -507,6 +511,29 @@ class LLMClient:
             log.info(f"LLM response in {elapsed:.2f}s | tool={tool_call.get('action') if tool_call else None} | {len(text)} chars")
             return text, tool_call
         except Exception as e:
+            err_str = str(e).lower()
+            # Detect safety filter blocks
+            if any(kw in err_str for kw in ['safety', 'blocked', 'filter', 'civic', 'recitation']):
+                log.warning(f"Safety filter triggered: {e}")
+                # Auto-retry with a softened prompt
+                try:
+                    retry_msg = (
+                        f"[System: previous response was safety-filtered. "
+                        f"Please provide a helpful, safe response to the user's request. "
+                        f"The user asked: {message[:500]}]"
+                    )
+                    result = self._call_with_rotation(lambda: (
+                        self._get_chat().send_message(retry_msg) if NEW_SDK
+                        else self._chat.send_message(retry_msg)
+                    ))
+                    if isinstance(result, str):
+                        return result, self._parse_tool_call(result)
+                    else:
+                        text, tool_call = self._extract_response_parts(result)
+                        return text, tool_call
+                except Exception:
+                    pass
+                return SAFETY_BLOCKED_MSG, None
             log.error(f"chat failed: {e}")
             return f"Error: {e}", None
 
