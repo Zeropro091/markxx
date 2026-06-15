@@ -282,7 +282,88 @@ class EdgeEngine:
             return False
 
 
-# ── Multi-engine TTS controller ───────────────────────────────────────────────
+# ── Voice catalog ─────────────────────────────────────────────────────────────
+
+VOICE_CATALOG = {
+    "kokoro": {
+        "af_heart": {"name": "Heart", "gender": "F", "accent": "US", "style": "warm, default"},
+        "af_bella": {"name": "Bella", "gender": "F", "accent": "US", "style": "soft"},
+        "af_nicole": {"name": "Nicole", "gender": "F", "accent": "US", "style": "professional"},
+        "af_sarah": {"name": "Sarah", "gender": "F", "accent": "US", "style": "clear"},
+        "af_sky": {"name": "Sky", "gender": "F", "accent": "US", "style": "bright"},
+        "am_adam": {"name": "Adam", "gender": "M", "accent": "US", "style": "deep"},
+        "am_michael": {"name": "Michael", "gender": "M", "accent": "US", "style": "neutral"},
+        "bf_emma": {"name": "Emma", "gender": "F", "accent": "UK", "style": "formal"},
+        "bf_isabella": {"name": "Isabella", "gender": "F", "accent": "UK", "style": "refined"},
+        "bm_george": {"name": "George", "gender": "M", "accent": "UK", "style": "distinguished"},
+        "bm_lewis": {"name": "Lewis", "gender": "M", "accent": "UK", "style": "friendly"},
+    },
+    "piper": {
+        "en_US-lessac-medium": {"name": "Lessac", "gender": "M", "accent": "US", "style": "default"},
+        "en_US-lessac-high": {"name": "Lessac HQ", "gender": "M", "accent": "US", "style": "high quality"},
+        "en_US-ryan-medium": {"name": "Ryan", "gender": "M", "accent": "US", "style": "medium"},
+        "en_US-ryan-high": {"name": "Ryan HQ", "gender": "M", "accent": "US", "style": "high quality"},
+        "en_US-amy-medium": {"name": "Amy", "gender": "F", "accent": "US", "style": "medium"},
+        "en_GB-alan-medium": {"name": "Alan", "gender": "M", "accent": "UK", "style": "medium"},
+        "en_GB-alba-medium": {"name": "Alba", "gender": "F", "accent": "UK", "style": "medium"},
+        "en_GB-cori-medium": {"name": "Cori", "gender": "F", "accent": "UK", "style": "medium"},
+    },
+    "orpheus": {
+        "tara": {"name": "Tara", "gender": "F", "accent": "US", "style": "expressive, default"},
+        "leah": {"name": "Leah", "gender": "F", "accent": "US", "style": "calm"},
+        "jess": {"name": "Jess", "gender": "F", "accent": "US", "style": "energetic"},
+        "leo": {"name": "Leo", "gender": "M", "accent": "US", "style": "confident"},
+        "dan": {"name": "Dan", "gender": "M", "accent": "US", "style": "casual"},
+        "mia": {"name": "Mia", "gender": "F", "accent": "US", "style": "warm"},
+        "zac": {"name": "Zac", "gender": "M", "accent": "US", "style": "young"},
+        "zoe": {"name": "Zoe", "gender": "F", "accent": "US", "style": "youthful"},
+    },
+    "edge": {
+        # English US
+        "en-US-AriaNeural": {"name": "Aria", "gender": "F", "accent": "US", "style": "conversational"},
+        "en-US-GuyNeural": {"name": "Guy", "gender": "M", "accent": "US", "style": "news anchor"},
+        "en-US-JennyNeural": {"name": "Jenny", "gender": "F", "accent": "US", "style": "friendly"},
+        "en-US-DavisNeural": {"name": "Davis", "gender": "M", "accent": "US", "style": "casual"},
+        "en-US-AmberNeural": {"name": "Amber", "gender": "F", "accent": "US", "style": "warm"},
+        "en-US-AndrewNeural": {"name": "Andrew", "gender": "M", "accent": "US", "style": "professional"},
+        "en-US-BrianNeural": {"name": "Brian", "gender": "M", "accent": "US", "style": "narrator"},
+        "en-US-EmmaNeural": {"name": "Emma", "gender": "F", "accent": "US", "style": "professional"},
+        "en-US-EricNeural": {"name": "Eric", "gender": "M", "accent": "US", "style": "calm"},
+        "en-US-MichelleNeural": {"name": "Michelle", "gender": "F", "accent": "US", "style": "assistant"},
+        "en-US-RogerNeural": {"name": "Roger", "gender": "M", "accent": "US", "style": "elderly wise"},
+        "en-US-SteffanNeural": {"name": "Steffan", "gender": "M", "accent": "US", "style": "storyteller"},
+        # English UK
+        "en-GB-RyanNeural": {"name": "Ryan", "gender": "M", "accent": "UK", "style": "British, default"},
+        "en-GB-SoniaNeural": {"name": "Sonia", "gender": "F", "accent": "UK", "style": "British female"},
+        "en-GB-ThomasNeural": {"name": "Thomas", "gender": "M", "accent": "UK", "style": "British formal"},
+        "en-GB-MaisieNeural": {"name": "Maisie", "gender": "F", "accent": "UK", "style": "British young"},
+        # English AU
+        "en-AU-NatashaNeural": {"name": "Natasha", "gender": "F", "accent": "AU", "style": "Australian"},
+        "en-AU-WilliamNeural": {"name": "William", "gender": "M", "accent": "AU", "style": "Australian"},
+        # Indonesian
+        "id-ID-ArdiNeural": {"name": "Ardi", "gender": "M", "accent": "ID", "style": "Indonesian male"},
+        "id-ID-GadisNeural": {"name": "Gadis", "gender": "F", "accent": "ID", "style": "Indonesian female"},
+        # Japanese
+        "ja-JP-NanamiNeural": {"name": "Nanami", "gender": "F", "accent": "JP", "style": "Japanese"},
+        "ja-JP-KeitaNeural": {"name": "Keita", "gender": "M", "accent": "JP", "style": "Japanese"},
+        # Korean
+        "ko-KR-SunHiNeural": {"name": "SunHi", "gender": "F", "accent": "KR", "style": "Korean"},
+        "ko-KR-InJoonNeural": {"name": "InJoon", "gender": "M", "accent": "KR", "style": "Korean"},
+        # Chinese
+        "zh-CN-XiaoxiaoNeural": {"name": "Xiaoxiao", "gender": "F", "accent": "CN", "style": "Chinese"},
+        "zh-CN-YunxiNeural": {"name": "Yunxi", "gender": "M", "accent": "CN", "style": "Chinese"},
+        # Spanish
+        "es-ES-ElviraNeural": {"name": "Elvira", "gender": "F", "accent": "ES", "style": "Spanish"},
+        "es-ES-AlvaroNeural": {"name": "Alvaro", "gender": "M", "accent": "ES", "style": "Spanish"},
+        # French
+        "fr-FR-DeniseNeural": {"name": "Denise", "gender": "F", "accent": "FR", "style": "French"},
+        "fr-FR-HenriNeural": {"name": "Henri", "gender": "M", "accent": "FR", "style": "French"},
+        # German
+        "de-DE-KatjaNeural": {"name": "Katja", "gender": "F", "accent": "DE", "style": "German"},
+        "de-DE-ConradNeural": {"name": "Conrad", "gender": "M", "accent": "DE", "style": "German"},
+    },
+}
+
 
 ENGINES = {
     "kokoro": KokoroEngine,
@@ -292,67 +373,81 @@ ENGINES = {
 }
 
 class MultiTTS:
-    """Switchable TTS engine with fallback chain.
+    """Switchable TTS engine with fallback chain and voice catalog.
 
     Usage:
         tts = MultiTTS(engine="kokoro")
         tts.speak("Hello")
-        tts.set_engine("piper")   # switch at runtime
-        tts.speak("Now using Piper")
+        tts.set_engine("piper")
+        tts.set_voice("af_bella")
+        tts.set_engine("edge", voice="en-US-AriaNeural")
     """
 
-    def __init__(self, engine: str = "kokoro", **kwargs):
+    def __init__(self, engine: str = "kokoro", voice: str = None, **kwargs):
         self._engine_name = engine
+        self._voice_id = voice
         self._kwargs = kwargs
-        self._engine = self._create_engine(engine, **kwargs)
+        self._engine = self._create_engine(engine, voice=voice, **kwargs)
         self._lock = threading.Lock()
         self._enabled = True
 
-    def _create_engine(self, name: str, **kwargs):
+    def _create_engine(self, name: str, voice: str = None, **kwargs):
         cls = ENGINES.get(name)
         if cls is None:
             log.warning(f"Unknown TTS engine '{name}', falling back to edge")
             cls = EdgeEngine
+            name = "edge"
+
+        if voice:
+            if name == "piper":
+                kwargs["model"] = voice
+            else:
+                kwargs["voice"] = voice
+
         try:
             return cls(**kwargs)
         except TypeError:
             return cls()
 
-    def set_engine(self, name: str, **kwargs):
+    def set_engine(self, name: str, voice: str = None, **kwargs):
         """Switch TTS engine at runtime."""
         with self._lock:
             self._engine_name = name
+            self._voice_id = voice
             self._kwargs = kwargs
-            self._engine = self._create_engine(name, **kwargs)
-            log.info(f"TTS engine switched to: {name}")
+            self._engine = self._create_engine(name, voice=voice, **kwargs)
+            log.info(f"TTS engine: {name}" + (f" voice={voice}" if voice else ""))
+
+    def set_voice(self, voice_id: str):
+        """Switch voice within the current engine."""
+        self._voice_id = voice_id
+        self.set_engine(self._engine_name, voice=voice_id, **self._kwargs)
 
     @property
     def engine_name(self) -> str:
         return self._engine_name
 
+    @property
+    def voice_id(self) -> str:
+        return self._voice_id
+
     def speak(self, text: str):
-        """Speak text using the current engine (with fallback)."""
         if not self._enabled or not text.strip():
             return
-
         cleaned = clean_for_tts(text)
         if not cleaned:
             return
-
         with self._lock:
             ok = self._engine.speak(cleaned)
             if not ok and self._engine_name != "edge":
                 log.warning(f"{self._engine_name} failed, falling back to edge")
-                fallback = EdgeEngine()
-                fallback.speak(cleaned)
+                EdgeEngine().speak(cleaned)
 
     def speak_async(self, text: str):
-        """Speak in background thread (non-blocking)."""
         t = threading.Thread(target=self.speak, args=(text,), daemon=True)
         t.start()
 
     def toggle(self) -> bool:
-        """Toggle TTS on/off. Returns new state."""
         self._enabled = not self._enabled
         return self._enabled
 
@@ -364,9 +459,29 @@ class MultiTTS:
     def enabled(self, val: bool):
         self._enabled = val
 
+    def list_voices(self, engine: str = None) -> dict:
+        return VOICE_CATALOG.get(engine or self._engine_name, {})
+
+    def list_voices_formatted(self, engine: str = None) -> str:
+        eng = engine or self._engine_name
+        voices = VOICE_CATALOG.get(eng, {})
+        if not voices:
+            return f"No voice catalog for '{eng}'"
+        lines = [f"Voices for {eng} ({len(voices)} available):"]
+        for vid, info in voices.items():
+            g = info.get("gender", "?")
+            a = info.get("accent", "?")
+            s = info.get("style", "")
+            n = info.get("name", vid)
+            lines.append(f"  {vid:30s}  {n:12s}  {g}  {a:4s}  {s}")
+        return "\n".join(lines)
+
     def status(self) -> dict:
         return {
             "engine": self._engine_name,
+            "voice": self._voice_id,
             "enabled": self._enabled,
             "available_engines": list(ENGINES.keys()),
+            "voice_count": {e: len(v) for e, v in VOICE_CATALOG.items()},
         }
+

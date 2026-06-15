@@ -537,20 +537,34 @@ def main():
 
             elif cmd == "/voice":
                 parts = user_input.split(maxsplit=1)
-                if len(parts) < 2:
-                    if tts:
-                        status = tts.status()
-                        print(f"  Current: {status['engine']}")
-                        print(f"  Available: {', '.join(status['available_engines'])}")
-                    else:
-                        print(f"  {YELLOW}TTS not available{RESET}")
+                if not tts:
+                    print(f"  {YELLOW}TTS not available{RESET}")
+                elif len(parts) < 2:
+                    status = tts.status()
+                    print(f"  Engine: {status['engine']} | Voice: {status.get('voice') or 'default'}")
+                    print(f"  Engines: {', '.join(status['available_engines'])}")
+                    vc = status.get('voice_count', {})
+                    print(f"  Voices: {' | '.join(f'{e}={c}' for e,c in vc.items())}")
+                    print(f"  {DIM}Usage: /voice ENGINE or /voice ENGINE:VOICE_ID{RESET}")
+                    print(f"  {DIM}List:  /voices [engine]{RESET}")
                 else:
-                    engine = parts[1].strip().lower()
-                    if tts:
-                        tts.set_engine(engine)
-                        print(f"  {GREEN}TTS engine: {engine}{RESET}")
+                    arg = parts[1].strip()
+                    if ":" in arg:
+                        engine, voice = arg.split(":", 1)
+                        tts.set_engine(engine.lower(), voice=voice)
+                        print(f"  {GREEN}TTS: {engine} voice={voice}{RESET}")
                     else:
-                        print(f"  {YELLOW}TTS not available{RESET}")
+                        tts.set_engine(arg.lower())
+                        print(f"  {GREEN}TTS engine: {arg}{RESET}")
+                continue
+
+            elif cmd == "/voices":
+                if tts:
+                    parts = user_input.split(maxsplit=1)
+                    eng = parts[1].strip() if len(parts) > 1 else None
+                    print(tts.list_voices_formatted(eng))
+                else:
+                    print(f"  {YELLOW}TTS not available{RESET}")
                 continue
 
             else:

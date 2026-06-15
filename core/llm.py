@@ -450,6 +450,19 @@ class LLMClient:
         }
         if self.max_tokens is not None:
             kwargs["max_output_tokens"] = self.max_tokens
+
+        # Cap thinking budget for thinking models to prevent infinite thinking
+        # Models like gemini-2.5-flash, 3.1-flash-lite default to unlimited thinking
+        model_lower = (self.model_name or "").lower()
+        if any(k in model_lower for k in ["2.5", "3.0", "3.1", "thinking", "pro"]):
+            try:
+                kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                    thinking_budget=2048,  # Fast responses, cap at 2k thinking tokens
+                )
+                log.debug("Thinking budget set to 2048 tokens")
+            except Exception:
+                pass  # Older SDK versions may not support ThinkingConfig
+
         # Inject native tool declarations if available
         if "tools" not in kwargs:
             decls = _get_tool_declarations()
